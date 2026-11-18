@@ -2,6 +2,8 @@
 
 These steps worked on the Moto G Power 2026 running Android 16 build W1WEOS36.48-22-3-3-4-2, with an already-unlocked bootloader and rooted Android on slot A. Verify those conditions, the candidate build manifest, and the vendor CRC results first. Back up user data and keep images in a private directory outside the checkout.
 
+This procedure and its candidate image are specific to that device and firmware. Users of other devices or firmware must build and verify their own image and recovery procedure; do not flash this candidate image on a different target.
+
 1. In a Linux shell with a working ADB connection, save the active 64 MiB stock boot partition and compare the two SHA-256 digests.
 
    ```sh

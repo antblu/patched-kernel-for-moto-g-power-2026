@@ -20,8 +20,15 @@ def main():
     image = (args.build_output / "arch/arm64/boot/Image").read_bytes()
     digest = hashlib.sha256(image).hexdigest()
     manifest = (args.build_output / "build-manifest.txt").read_text().splitlines()
+    supported_profiles = {
+        "profile=experimental-namespaces",
+        "profile=experimental-namespaces-pids",
+        "profile=experimental-namespaces-pids-vxlan",
+        "profile=experimental-namespaces-pids-vxlan-bridge",
+        "profile=experimental-namespaces-pids-vxlan-cfs",
+    }
     if (f"{digest}  arch/arm64/boot/Image" not in manifest or
-            "profile=experimental-namespaces" not in manifest or image[56:60] != b"ARM\x64"):
+            supported_profiles.isdisjoint(manifest) or image[56:60] != b"ARM\x64"):
         parser.error("Expected a manifest-verified namespace build.")
     with args.stock_boot.open("rb") as stock:
         header = bytearray(stock.read(PAGE))

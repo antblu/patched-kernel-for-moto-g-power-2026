@@ -1,0 +1,134 @@
+--- a/include/linux/skbuff.h
++++ b/include/linux/skbuff.h
+@@ -4373,7 +4373,7 @@
+ 
+ #ifdef CONFIG_SKB_EXTENSIONS
+ enum skb_ext_id {
+-#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER)
++#if IS_ENABLED(CONFIG_BRIDGE_NETFILTER) && !defined(MOTO_BRIDGE_LEGACY_SKB_EXT)
+ 	SKB_EXT_BRIDGE_NF,
+ #endif
+ #ifdef CONFIG_XFRM
+@@ -4387,6 +4387,14 @@
+ #endif
+ 	SKB_EXT_NUM, /* must be last */
+ };
++
++#ifdef MOTO_BRIDGE_LEGACY_SKB_EXT
++/* Keep the stock extension IDs and array bound. */
++#define SKB_EXT_BRIDGE_NF ((enum skb_ext_id)SKB_EXT_NUM)
++#define SKB_EXT_RUNTIME_NUM (SKB_EXT_NUM + 1)
++#else
++#define SKB_EXT_RUNTIME_NUM SKB_EXT_NUM
++#endif
+ 
+ /**
+  *	struct skb_ext - sk_buff extensions
+@@ -4402,6 +4410,10 @@
+ 	refcount_t refcnt;
+ 	u8 offset[SKB_EXT_NUM]; /* in chunks of 8 bytes */
+ 	u8 chunks;		/* same */
++#if defined(MOTO_BRIDGE_LEGACY_SKB_EXT) && !defined(__GENKSYMS__)
++	/* Stored in padding before data, beyond all stock members. */
++	u8 bridge_offset;
++#endif
+ 	char data[] __aligned(8);
+ };
+ 
+@@ -4437,9 +4449,18 @@
+ 	__skb_ext_copy(dst, src);
+ }
+ 
++static inline u8 skb_ext_offset(const struct skb_ext *ext, enum skb_ext_id id)
++{
++#if defined(MOTO_BRIDGE_LEGACY_SKB_EXT) && !defined(__GENKSYMS__)
++	if (id == SKB_EXT_BRIDGE_NF)
++		return ext->bridge_offset;
++#endif
++	return ext->offset[id];
++}
++
+ static inline bool __skb_ext_exist(const struct skb_ext *ext, enum skb_ext_id i)
+ {
+-	return !!ext->offset[i];
++	return !!skb_ext_offset(ext, i);
+ }
+ 
+ static inline bool skb_ext_exist(const struct sk_buff *skb, enum skb_ext_id id)
+@@ -4458,7 +4479,7 @@
+ 	if (skb_ext_exist(skb, id)) {
+ 		struct skb_ext *ext = skb->extensions;
+ 
+-		return (void *)ext + (ext->offset[id] << 3);
++		return (void *)ext + (skb_ext_offset(ext, id) << 3);
+ 	}
+ 
+ 	return NULL;
+--- a/net/core/skbuff.c
++++ b/net/core/skbuff.c
+@@ -4562,7 +4562,14 @@
+ 
+ static void skb_extensions_init(void)
+ {
+-	BUILD_BUG_ON(SKB_EXT_NUM >= 8);
++	BUILD_BUG_ON(SKB_EXT_RUNTIME_NUM >= 8);
++#ifdef MOTO_BRIDGE_LEGACY_SKB_EXT
++	BUILD_BUG_ON(SKB_EXT_NUM != 1);
++	BUILD_BUG_ON(offsetof(struct skb_ext, offset) != 4);
++	BUILD_BUG_ON(offsetof(struct skb_ext, chunks) != 5);
++	BUILD_BUG_ON(offsetof(struct skb_ext, data) != 8);
++	BUILD_BUG_ON(sizeof(struct skb_ext) != 8);
++#endif
+ 	BUILD_BUG_ON(skb_ext_total_length() > 255);
+ 
+ 	skbuff_ext_cache = kmem_cache_create("skbuff_ext_cache",
+@@ -6496,9 +6503,20 @@
+ }
+ 
+ #ifdef CONFIG_SKB_EXTENSIONS
++static void skb_ext_set_offset(struct skb_ext *ext, enum skb_ext_id id, u8 offset)
++{
++#ifdef MOTO_BRIDGE_LEGACY_SKB_EXT
++	if (id == SKB_EXT_BRIDGE_NF) {
++		ext->bridge_offset = offset;
++		return;
++	}
++#endif
++	ext->offset[id] = offset;
++}
++
+ static void *skb_ext_get_ptr(struct skb_ext *ext, enum skb_ext_id id)
+ {
+-	return (void *)ext + (ext->offset[id] * SKB_EXT_ALIGN_VALUE);
++	return (void *)ext + (skb_ext_offset(ext, id) * SKB_EXT_ALIGN_VALUE);
+ }
+ 
+ /**
+@@ -6516,6 +6534,9 @@
+ 
+ 	if (new) {
+ 		memset(new->offset, 0, sizeof(new->offset));
++#ifdef MOTO_BRIDGE_LEGACY_SKB_EXT
++		new->bridge_offset = 0;
++#endif
+ 		refcount_set(&new->refcnt, 1);
+ 	}
+ 
+@@ -6568,7 +6589,7 @@
+ 	skb_ext_put(skb);
+ 	newlen = newoff + skb_ext_type_len[id];
+ 	ext->chunks = newlen;
+-	ext->offset[id] = newoff;
++	skb_ext_set_offset(ext, id, newoff);
+ 	skb->extensions = ext;
+ 	skb->active_extensions = 1 << id;
+ 	return skb_ext_get_ptr(ext, id);
+@@ -6614,7 +6635,7 @@
+ 
+ 	newlen = newoff + skb_ext_type_len[id];
+ 	new->chunks = newlen;
+-	new->offset[id] = newoff;
++	skb_ext_set_offset(new, id, newoff);
+ set_active:
+ 	skb->slow_gro = 1;
+ 	skb->extensions = new;

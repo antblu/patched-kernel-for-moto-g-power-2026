@@ -1,0 +1,778 @@
+--- a/kernel/sched/sched.h
++++ b/kernel/sched/sched.h
+@@ -363,8 +363,11 @@
+ 
+ extern struct list_head task_groups;
+ 
+-struct cfs_bandwidth {
++/* Keep the stock vendor-visible placeholder and store quota state separately. */
++struct cfs_bandwidth {};
++
+ #ifdef CONFIG_CFS_BANDWIDTH
++struct cfs_bw_state {
+ 	raw_spinlock_t		lock;
+ 	ktime_t			period;
+ 	u64			quota;
+@@ -383,8 +386,28 @@
+ 	int			nr_periods;
+ 	int			nr_throttled;
+ 	u64			throttled_time;
+-#endif
+ };
++
++struct cfs_bw_rq {
++	struct cfs_rq *rq;
++	int			runtime_enabled;
++	s64			runtime_remaining;
++
++	u64			throttled_clock;
++	u64			throttled_clock_pelt;
++	u64			throttled_clock_pelt_time;
++	int			throttled;
++	int			throttle_count;
++	struct list_head	throttled_list;
++};
++
++struct cfs_bw_group {
++	struct cfs_bw_state bandwidth;
++	struct cfs_bw_rq runqueues[];
++};
++#else
++struct cfs_bw_state;
++#endif
+ 
+ /* Task group related information */
+ struct task_group {
+@@ -443,7 +466,11 @@
+ 	ANDROID_VENDOR_DATA_ARRAY(1, 4);
+ #endif
+ 
++#ifdef CONFIG_CFS_BANDWIDTH
++	ANDROID_KABI_USE(1, struct cfs_bw_group *cfs_bw);
++#else
+ 	ANDROID_KABI_RESERVE(1);
++#endif
+ 	ANDROID_KABI_RESERVE(2);
+ 	ANDROID_KABI_RESERVE(3);
+ 	ANDROID_KABI_RESERVE(4);
+@@ -489,10 +516,20 @@
+ extern void init_tg_cfs_entry(struct task_group *tg, struct cfs_rq *cfs_rq,
+ 			struct sched_entity *se, int cpu,
+ 			struct sched_entity *parent);
+-extern void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
+-
+-extern void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth *cfs_b);
+-extern void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b);
++static inline struct cfs_bw_state *tg_cfs_bandwidth(struct task_group *tg)
++{
++#ifdef CONFIG_CFS_BANDWIDTH
++	return &tg->cfs_bw->bandwidth;
++#else
++	return NULL;
++#endif
++}
++
++extern bool alloc_cfs_bandwidth(struct task_group *tg, gfp_t flags);
++extern void free_cfs_bandwidth(struct task_group *tg);
++
++extern void __refill_cfs_bandwidth_runtime(struct cfs_bw_state *cfs_b);
++extern void start_cfs_bandwidth(struct cfs_bw_state *cfs_b);
+ extern void unthrottle_cfs_rq(struct cfs_rq *cfs_rq);
+ 
+ extern void unregister_rt_sched_group(struct task_group *tg);
+@@ -619,17 +656,6 @@
+ 	/* Locally cached copy of our task_group's idle value */
+ 	int			idle;
+ 
+-#ifdef CONFIG_CFS_BANDWIDTH
+-	int			runtime_enabled;
+-	s64			runtime_remaining;
+-
+-	u64			throttled_clock;
+-	u64			throttled_clock_pelt;
+-	u64			throttled_clock_pelt_time;
+-	int			throttled;
+-	int			throttle_count;
+-	struct list_head	throttled_list;
+-#endif /* CONFIG_CFS_BANDWIDTH */
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ };
+ 
+@@ -1163,6 +1189,13 @@
+ 	return 0;
+ #endif
+ }
++
++#ifdef CONFIG_CFS_BANDWIDTH
++static inline struct cfs_bw_rq *cfs_bw_rq(struct cfs_rq *cfs_rq)
++{
++	return &cfs_rq->tg->cfs_bw->runqueues[cpu_of(rq_of(cfs_rq))];
++}
++#endif
+ 
+ #define MDF_PUSH	0x01
+ 
+--- a/kernel/sched/core.c
++++ b/kernel/sched/core.c
+@@ -9601,7 +9601,7 @@
+ 		ptr += nr_cpu_ids * sizeof(void **);
+ 
+ 		root_task_group.shares = ROOT_TASK_GROUP_LOAD;
+-		init_cfs_bandwidth(&root_task_group.cfs_bandwidth);
++		BUG_ON(!alloc_cfs_bandwidth(&root_task_group, GFP_NOWAIT));
+ #endif /* CONFIG_FAIR_GROUP_SCHED */
+ #ifdef CONFIG_RT_GROUP_SCHED
+ 		root_task_group.rt_se = (struct sched_rt_entity **)ptr;
+@@ -10524,7 +10524,7 @@
+ 				u64 burst)
+ {
+ 	int i, ret = 0, runtime_enabled, runtime_was_enabled;
+-	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct cfs_bw_state *cfs_b = tg_cfs_bandwidth(tg);
+ 
+ 	if (tg == &root_task_group)
+ 		return -EINVAL;
+@@ -10556,7 +10556,7 @@
+ 		return -EINVAL;
+ 
+ 	/*
+-	 * Prevent race between setting of cfs_rq->runtime_enabled and
++	 * Prevent race between setting of cfs_bw_rq(cfs_rq)->runtime_enabled and
+ 	 * unthrottle_offline_cfs_rqs().
+ 	 */
+ 	cpus_read_lock();
+@@ -10592,10 +10592,10 @@
+ 		struct rq_flags rf;
+ 
+ 		rq_lock_irq(rq, &rf);
+-		cfs_rq->runtime_enabled = runtime_enabled;
+-		cfs_rq->runtime_remaining = 0;
+-
+-		if (cfs_rq->throttled)
++		cfs_bw_rq(cfs_rq)->runtime_enabled = runtime_enabled;
++		cfs_bw_rq(cfs_rq)->runtime_remaining = 0;
++
++		if (cfs_bw_rq(cfs_rq)->throttled)
+ 			unthrottle_cfs_rq(cfs_rq);
+ 		rq_unlock_irq(rq, &rf);
+ 	}
+@@ -10612,8 +10612,8 @@
+ {
+ 	u64 quota, period, burst;
+ 
+-	period = ktime_to_ns(tg->cfs_bandwidth.period);
+-	burst = tg->cfs_bandwidth.burst;
++	period = ktime_to_ns(tg_cfs_bandwidth(tg)->period);
++	burst = tg_cfs_bandwidth(tg)->burst;
+ 	if (cfs_quota_us < 0)
+ 		quota = RUNTIME_INF;
+ 	else if ((u64)cfs_quota_us <= U64_MAX / NSEC_PER_USEC)
+@@ -10628,10 +10628,10 @@
+ {
+ 	u64 quota_us;
+ 
+-	if (tg->cfs_bandwidth.quota == RUNTIME_INF)
++	if (tg_cfs_bandwidth(tg)->quota == RUNTIME_INF)
+ 		return -1;
+ 
+-	quota_us = tg->cfs_bandwidth.quota;
++	quota_us = tg_cfs_bandwidth(tg)->quota;
+ 	do_div(quota_us, NSEC_PER_USEC);
+ 
+ 	return quota_us;
+@@ -10645,8 +10645,8 @@
+ 		return -EINVAL;
+ 
+ 	period = (u64)cfs_period_us * NSEC_PER_USEC;
+-	quota = tg->cfs_bandwidth.quota;
+-	burst = tg->cfs_bandwidth.burst;
++	quota = tg_cfs_bandwidth(tg)->quota;
++	burst = tg_cfs_bandwidth(tg)->burst;
+ 
+ 	return tg_set_cfs_bandwidth(tg, period, quota, burst);
+ }
+@@ -10655,7 +10655,7 @@
+ {
+ 	u64 cfs_period_us;
+ 
+-	cfs_period_us = ktime_to_ns(tg->cfs_bandwidth.period);
++	cfs_period_us = ktime_to_ns(tg_cfs_bandwidth(tg)->period);
+ 	do_div(cfs_period_us, NSEC_PER_USEC);
+ 
+ 	return cfs_period_us;
+@@ -10669,8 +10669,8 @@
+ 		return -EINVAL;
+ 
+ 	burst = (u64)cfs_burst_us * NSEC_PER_USEC;
+-	period = ktime_to_ns(tg->cfs_bandwidth.period);
+-	quota = tg->cfs_bandwidth.quota;
++	period = ktime_to_ns(tg_cfs_bandwidth(tg)->period);
++	quota = tg_cfs_bandwidth(tg)->quota;
+ 
+ 	return tg_set_cfs_bandwidth(tg, period, quota, burst);
+ }
+@@ -10679,7 +10679,7 @@
+ {
+ 	u64 burst_us;
+ 
+-	burst_us = tg->cfs_bandwidth.burst;
++	burst_us = tg_cfs_bandwidth(tg)->burst;
+ 	do_div(burst_us, NSEC_PER_USEC);
+ 
+ 	return burst_us;
+@@ -10753,13 +10753,13 @@
+ static int tg_cfs_schedulable_down(struct task_group *tg, void *data)
+ {
+ 	struct cfs_schedulable_data *d = data;
+-	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct cfs_bw_state *cfs_b = tg_cfs_bandwidth(tg);
+ 	s64 quota = 0, parent_quota = -1;
+ 
+ 	if (!tg->parent) {
+ 		quota = RUNTIME_INF;
+ 	} else {
+-		struct cfs_bandwidth *parent_b = &tg->parent->cfs_bandwidth;
++		struct cfs_bw_state *parent_b = tg_cfs_bandwidth(tg->parent);
+ 
+ 		quota = normalize_cfs_quota(tg, d);
+ 		parent_quota = parent_b->hierarchical_quota;
+@@ -10807,7 +10807,7 @@
+ static int cpu_cfs_stat_show(struct seq_file *sf, void *v)
+ {
+ 	struct task_group *tg = css_tg(seq_css(sf));
+-	struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++	struct cfs_bw_state *cfs_b = tg_cfs_bandwidth(tg);
+ 
+ 	seq_printf(sf, "nr_periods %d\n", cfs_b->nr_periods);
+ 	seq_printf(sf, "nr_throttled %d\n", cfs_b->nr_throttled);
+@@ -10943,7 +10943,7 @@
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 	{
+ 		struct task_group *tg = css_tg(css);
+-		struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++		struct cfs_bw_state *cfs_b = tg_cfs_bandwidth(tg);
+ 		u64 throttled_usec;
+ 
+ 		throttled_usec = cfs_b->throttled_time;
+@@ -11068,7 +11068,7 @@
+ {
+ 	struct task_group *tg = css_tg(of_css(of));
+ 	u64 period = tg_get_cfs_period(tg);
+-	u64 burst = tg->cfs_bandwidth.burst;
++	u64 burst = tg_cfs_bandwidth(tg)->burst;
+ 	u64 quota;
+ 	int ret;
+ 
+--- a/kernel/sched/fair.c
++++ b/kernel/sched/fair.c
+@@ -4876,7 +4876,7 @@
+  *
+  * requires cfs_b->lock
+  */
+-void __refill_cfs_bandwidth_runtime(struct cfs_bandwidth *cfs_b)
++void __refill_cfs_bandwidth_runtime(struct cfs_bw_state *cfs_b)
+ {
+ 	if (unlikely(cfs_b->quota == RUNTIME_INF))
+ 		return;
+@@ -4885,13 +4885,8 @@
+ 	cfs_b->runtime = min(cfs_b->runtime, cfs_b->quota + cfs_b->burst);
+ }
+ 
+-static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
+-{
+-	return &tg->cfs_bandwidth;
+-}
+-
+ /* returns 0 on failure to allocate runtime */
+-static int __assign_cfs_rq_runtime(struct cfs_bandwidth *cfs_b,
++static int __assign_cfs_rq_runtime(struct cfs_bw_state *cfs_b,
+ 				   struct cfs_rq *cfs_rq, u64 target_runtime)
+ {
+ 	u64 min_amount, amount = 0;
+@@ -4899,7 +4894,7 @@
+ 	lockdep_assert_held(&cfs_b->lock);
+ 
+ 	/* note: this is a positive sum as runtime_remaining <= 0 */
+-	min_amount = target_runtime - cfs_rq->runtime_remaining;
++	min_amount = target_runtime - cfs_bw_rq(cfs_rq)->runtime_remaining;
+ 
+ 	if (cfs_b->quota == RUNTIME_INF)
+ 		amount = min_amount;
+@@ -4913,15 +4908,15 @@
+ 		}
+ 	}
+ 
+-	cfs_rq->runtime_remaining += amount;
+-
+-	return cfs_rq->runtime_remaining > 0;
++	cfs_bw_rq(cfs_rq)->runtime_remaining += amount;
++
++	return cfs_bw_rq(cfs_rq)->runtime_remaining > 0;
+ }
+ 
+ /* returns 0 on failure to allocate runtime */
+ static int assign_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
+-	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	struct cfs_bw_state *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+ 	int ret;
+ 
+ 	raw_spin_lock(&cfs_b->lock);
+@@ -4934,12 +4929,12 @@
+ static void __account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
+ {
+ 	/* dock delta_exec before expiring quota (as it could span periods) */
+-	cfs_rq->runtime_remaining -= delta_exec;
+-
+-	if (likely(cfs_rq->runtime_remaining > 0))
++	cfs_bw_rq(cfs_rq)->runtime_remaining -= delta_exec;
++
++	if (likely(cfs_bw_rq(cfs_rq)->runtime_remaining > 0))
+ 		return;
+ 
+-	if (cfs_rq->throttled)
++	if (cfs_bw_rq(cfs_rq)->throttled)
+ 		return;
+ 	/*
+ 	 * if we're unable to extend our runtime we resched so that the active
+@@ -4952,7 +4947,7 @@
+ static __always_inline
+ void account_cfs_rq_runtime(struct cfs_rq *cfs_rq, u64 delta_exec)
+ {
+-	if (!cfs_bandwidth_used() || !cfs_rq->runtime_enabled)
++	if (!cfs_bandwidth_used() || !cfs_bw_rq(cfs_rq)->runtime_enabled)
+ 		return;
+ 
+ 	__account_cfs_rq_runtime(cfs_rq, delta_exec);
+@@ -4960,13 +4955,13 @@
+ 
+ static inline int cfs_rq_throttled(struct cfs_rq *cfs_rq)
+ {
+-	return cfs_bandwidth_used() && cfs_rq->throttled;
++	return cfs_bandwidth_used() && cfs_bw_rq(cfs_rq)->throttled;
+ }
+ 
+ /* check whether cfs_rq, or any parent, is throttled */
+ static inline int throttled_hierarchy(struct cfs_rq *cfs_rq)
+ {
+-	return cfs_bandwidth_used() && cfs_rq->throttle_count;
++	return cfs_bandwidth_used() && cfs_bw_rq(cfs_rq)->throttle_count;
+ }
+ 
+ /*
+@@ -4991,10 +4986,10 @@
+ 	struct rq *rq = data;
+ 	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+ 
+-	cfs_rq->throttle_count--;
+-	if (!cfs_rq->throttle_count) {
+-		cfs_rq->throttled_clock_pelt_time += rq_clock_task_mult(rq) -
+-					     cfs_rq->throttled_clock_pelt;
++	cfs_bw_rq(cfs_rq)->throttle_count--;
++	if (!cfs_bw_rq(cfs_rq)->throttle_count) {
++		cfs_bw_rq(cfs_rq)->throttled_clock_pelt_time += rq_clock_task_mult(rq) -
++					     cfs_bw_rq(cfs_rq)->throttled_clock_pelt;
+ 
+ 		/* Add cfs_rq with load or one or more already running entities to the list */
+ 		if (!cfs_rq_is_decayed(cfs_rq) || cfs_rq->nr_running)
+@@ -5010,11 +5005,11 @@
+ 	struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+ 
+ 	/* group is entering throttled state, stop time */
+-	if (!cfs_rq->throttle_count) {
+-		cfs_rq->throttled_clock_pelt = rq_clock_task_mult(rq);
++	if (!cfs_bw_rq(cfs_rq)->throttle_count) {
++		cfs_bw_rq(cfs_rq)->throttled_clock_pelt = rq_clock_task_mult(rq);
+ 		list_del_leaf_cfs_rq(cfs_rq);
+ 	}
+-	cfs_rq->throttle_count++;
++	cfs_bw_rq(cfs_rq)->throttle_count++;
+ 
+ 	return 0;
+ }
+@@ -5022,7 +5017,7 @@
+ static bool throttle_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	struct rq *rq = rq_of(cfs_rq);
+-	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	struct cfs_bw_state *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+ 	struct sched_entity *se;
+ 	long task_delta, idle_task_delta, dequeue = 1;
+ 
+@@ -5039,7 +5034,7 @@
+ 		 */
+ 		dequeue = 0;
+ 	} else {
+-		list_add_tail_rcu(&cfs_rq->throttled_list,
++		list_add_tail_rcu(&cfs_bw_rq(cfs_rq)->throttled_list,
+ 				  &cfs_b->throttled_cfs_rq);
+ 	}
+ 	raw_spin_unlock(&cfs_b->lock);
+@@ -5101,27 +5096,27 @@
+ 	 * Note: distribution will already see us throttled via the
+ 	 * throttled-list.  rq->lock protects completion.
+ 	 */
+-	cfs_rq->throttled = 1;
+-	cfs_rq->throttled_clock = rq_clock(rq);
++	cfs_bw_rq(cfs_rq)->throttled = 1;
++	cfs_bw_rq(cfs_rq)->throttled_clock = rq_clock(rq);
+ 	return true;
+ }
+ 
+ void unthrottle_cfs_rq(struct cfs_rq *cfs_rq)
+ {
+ 	struct rq *rq = rq_of(cfs_rq);
+-	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	struct cfs_bw_state *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+ 	struct sched_entity *se;
+ 	long task_delta, idle_task_delta;
+ 
+ 	se = cfs_rq->tg->se[cpu_of(rq)];
+ 
+-	cfs_rq->throttled = 0;
++	cfs_bw_rq(cfs_rq)->throttled = 0;
+ 
+ 	update_rq_clock(rq);
+ 
+ 	raw_spin_lock(&cfs_b->lock);
+-	cfs_b->throttled_time += rq_clock(rq) - cfs_rq->throttled_clock;
+-	list_del_rcu(&cfs_rq->throttled_list);
++	cfs_b->throttled_time += rq_clock(rq) - cfs_bw_rq(cfs_rq)->throttled_clock;
++	list_del_rcu(&cfs_bw_rq(cfs_rq)->throttled_list);
+ 	raw_spin_unlock(&cfs_b->lock);
+ 
+ 	/* update hierarchical throttle state */
+@@ -5201,14 +5196,14 @@
+ 		resched_curr(rq);
+ }
+ 
+-static void distribute_cfs_runtime(struct cfs_bandwidth *cfs_b)
+-{
+-	struct cfs_rq *cfs_rq;
++static void distribute_cfs_runtime(struct cfs_bw_state *cfs_b)
++{
++	struct cfs_bw_rq *runtime_rq;
+ 	u64 runtime, remaining = 1;
+ 
+ 	rcu_read_lock();
+-	list_for_each_entry_rcu(cfs_rq, &cfs_b->throttled_cfs_rq,
+-				throttled_list) {
++	list_for_each_entry_rcu(runtime_rq, &cfs_b->throttled_cfs_rq, throttled_list) {
++		struct cfs_rq *cfs_rq = runtime_rq->rq;
+ 		struct rq *rq = rq_of(cfs_rq);
+ 		struct rq_flags rf;
+ 
+@@ -5217,20 +5212,20 @@
+ 			goto next;
+ 
+ 		/* By the above check, this should never be true */
+-		SCHED_WARN_ON(cfs_rq->runtime_remaining > 0);
++		SCHED_WARN_ON(cfs_bw_rq(cfs_rq)->runtime_remaining > 0);
+ 
+ 		raw_spin_lock(&cfs_b->lock);
+-		runtime = -cfs_rq->runtime_remaining + 1;
++		runtime = -cfs_bw_rq(cfs_rq)->runtime_remaining + 1;
+ 		if (runtime > cfs_b->runtime)
+ 			runtime = cfs_b->runtime;
+ 		cfs_b->runtime -= runtime;
+ 		remaining = cfs_b->runtime;
+ 		raw_spin_unlock(&cfs_b->lock);
+ 
+-		cfs_rq->runtime_remaining += runtime;
++		cfs_bw_rq(cfs_rq)->runtime_remaining += runtime;
+ 
+ 		/* we check whether we're throttled above */
+-		if (cfs_rq->runtime_remaining > 0)
++		if (cfs_bw_rq(cfs_rq)->runtime_remaining > 0)
+ 			unthrottle_cfs_rq(cfs_rq);
+ 
+ next:
+@@ -5248,7 +5243,7 @@
+  * period the timer is deactivated until scheduling resumes; cfs_b->idle is
+  * used to track this state.
+  */
+-static int do_sched_cfs_period_timer(struct cfs_bandwidth *cfs_b, int overrun, unsigned long flags)
++static int do_sched_cfs_period_timer(struct cfs_bw_state *cfs_b, int overrun, unsigned long flags)
+ {
+ 	int throttled;
+ 
+@@ -5318,7 +5313,7 @@
+  * hrtimer base being cleared by hrtimer_start. In the case of
+  * migrate_hrtimers, base is never cleared, so we are fine.
+  */
+-static int runtime_refresh_within(struct cfs_bandwidth *cfs_b, u64 min_expire)
++static int runtime_refresh_within(struct cfs_bw_state *cfs_b, u64 min_expire)
+ {
+ 	struct hrtimer *refresh_timer = &cfs_b->period_timer;
+ 	s64 remaining;
+@@ -5335,7 +5330,7 @@
+ 	return 0;
+ }
+ 
+-static void start_cfs_slack_bandwidth(struct cfs_bandwidth *cfs_b)
++static void start_cfs_slack_bandwidth(struct cfs_bw_state *cfs_b)
+ {
+ 	u64 min_left = cfs_bandwidth_slack_period + min_bandwidth_expiration;
+ 
+@@ -5356,8 +5351,8 @@
+ /* we know any runtime found here is valid as update_curr() precedes return */
+ static void __return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
+-	struct cfs_bandwidth *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
+-	s64 slack_runtime = cfs_rq->runtime_remaining - min_cfs_rq_runtime;
++	struct cfs_bw_state *cfs_b = tg_cfs_bandwidth(cfs_rq->tg);
++	s64 slack_runtime = cfs_bw_rq(cfs_rq)->runtime_remaining - min_cfs_rq_runtime;
+ 
+ 	if (slack_runtime <= 0)
+ 		return;
+@@ -5374,7 +5369,7 @@
+ 	raw_spin_unlock(&cfs_b->lock);
+ 
+ 	/* even if it's not valid for return we don't want to try again */
+-	cfs_rq->runtime_remaining -= slack_runtime;
++	cfs_bw_rq(cfs_rq)->runtime_remaining -= slack_runtime;
+ }
+ 
+ static __always_inline void return_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+@@ -5382,7 +5377,7 @@
+ 	if (!cfs_bandwidth_used())
+ 		return;
+ 
+-	if (!cfs_rq->runtime_enabled || cfs_rq->nr_running)
++	if (!cfs_bw_rq(cfs_rq)->runtime_enabled || cfs_rq->nr_running)
+ 		return;
+ 
+ 	__return_cfs_rq_runtime(cfs_rq);
+@@ -5392,7 +5387,7 @@
+  * This is done with a timer (instead of inline with bandwidth return) since
+  * it's necessary to juggle rq->locks to unthrottle their respective cfs_rqs.
+  */
+-static void do_sched_cfs_slack_timer(struct cfs_bandwidth *cfs_b)
++static void do_sched_cfs_slack_timer(struct cfs_bw_state *cfs_b)
+ {
+ 	u64 runtime = 0, slice = sched_cfs_bandwidth_slice();
+ 	unsigned long flags;
+@@ -5428,7 +5423,7 @@
+ 		return;
+ 
+ 	/* an active group must be handled by the update_curr()->put() path */
+-	if (!cfs_rq->runtime_enabled || cfs_rq->curr)
++	if (!cfs_bw_rq(cfs_rq)->runtime_enabled || cfs_rq->curr)
+ 		return;
+ 
+ 	/* ensure the group is not already throttled */
+@@ -5437,7 +5432,7 @@
+ 
+ 	/* update runtime allocation */
+ 	account_cfs_rq_runtime(cfs_rq, 0);
+-	if (cfs_rq->runtime_remaining <= 0)
++	if (cfs_bw_rq(cfs_rq)->runtime_remaining <= 0)
+ 		throttle_cfs_rq(cfs_rq);
+ }
+ 
+@@ -5454,8 +5449,8 @@
+ 	cfs_rq = tg->cfs_rq[cpu];
+ 	pcfs_rq = tg->parent->cfs_rq[cpu];
+ 
+-	cfs_rq->throttle_count = pcfs_rq->throttle_count;
+-	cfs_rq->throttled_clock_pelt = rq_clock_task_mult(cpu_rq(cpu));
++	cfs_bw_rq(cfs_rq)->throttle_count = cfs_bw_rq(pcfs_rq)->throttle_count;
++	cfs_bw_rq(cfs_rq)->throttled_clock_pelt = rq_clock_task_mult(cpu_rq(cpu));
+ }
+ 
+ /* conditionally throttle active cfs_rq's from put_prev_entity() */
+@@ -5464,7 +5459,7 @@
+ 	if (!cfs_bandwidth_used())
+ 		return false;
+ 
+-	if (likely(!cfs_rq->runtime_enabled || cfs_rq->runtime_remaining > 0))
++	if (likely(!cfs_bw_rq(cfs_rq)->runtime_enabled || cfs_bw_rq(cfs_rq)->runtime_remaining > 0))
+ 		return false;
+ 
+ 	/*
+@@ -5479,8 +5474,8 @@
+ 
+ static enum hrtimer_restart sched_cfs_slack_timer(struct hrtimer *timer)
+ {
+-	struct cfs_bandwidth *cfs_b =
+-		container_of(timer, struct cfs_bandwidth, slack_timer);
++	struct cfs_bw_state *cfs_b =
++		container_of(timer, struct cfs_bw_state, slack_timer);
+ 
+ 	do_sched_cfs_slack_timer(cfs_b);
+ 
+@@ -5491,8 +5486,8 @@
+ 
+ static enum hrtimer_restart sched_cfs_period_timer(struct hrtimer *timer)
+ {
+-	struct cfs_bandwidth *cfs_b =
+-		container_of(timer, struct cfs_bandwidth, period_timer);
++	struct cfs_bw_state *cfs_b =
++		container_of(timer, struct cfs_bw_state, period_timer);
+ 	unsigned long flags;
+ 	int overrun;
+ 	int idle = 0;
+@@ -5544,8 +5539,17 @@
+ 	return idle ? HRTIMER_NORESTART : HRTIMER_RESTART;
+ }
+ 
+-void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
+-{
++bool alloc_cfs_bandwidth(struct task_group *tg, gfp_t flags)
++{
++	struct cfs_bw_group *state;
++	struct cfs_bw_state *cfs_b;
++
++	state = kzalloc(struct_size(state, runqueues, nr_cpu_ids), flags);
++	if (!state)
++		return false;
++	tg->cfs_bw = state;
++	cfs_b = &state->bandwidth;
++
+ 	raw_spin_lock_init(&cfs_b->lock);
+ 	cfs_b->runtime = 0;
+ 	cfs_b->quota = RUNTIME_INF;
+@@ -5558,15 +5562,22 @@
+ 	hrtimer_init(&cfs_b->slack_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+ 	cfs_b->slack_timer.function = sched_cfs_slack_timer;
+ 	cfs_b->slack_started = false;
++	return true;
++}
++
++void free_cfs_bandwidth(struct task_group *tg)
++{
++	kfree(tg->cfs_bw);
+ }
+ 
+ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq)
+ {
+-	cfs_rq->runtime_enabled = 0;
+-	INIT_LIST_HEAD(&cfs_rq->throttled_list);
+-}
+-
+-void start_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
++	cfs_bw_rq(cfs_rq)->runtime_enabled = 0;
++	cfs_bw_rq(cfs_rq)->rq = cfs_rq;
++	INIT_LIST_HEAD(&cfs_bw_rq(cfs_rq)->throttled_list);
++}
++
++void start_cfs_bandwidth(struct cfs_bw_state *cfs_b)
+ {
+ 	lockdep_assert_held(&cfs_b->lock);
+ 
+@@ -5578,7 +5589,7 @@
+ 	hrtimer_start_expires(&cfs_b->period_timer, HRTIMER_MODE_ABS_PINNED);
+ }
+ 
+-static void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b)
++static void destroy_cfs_bandwidth(struct cfs_bw_state *cfs_b)
+ {
+ 	/* init_cfs_bandwidth() was not called */
+ 	if (!cfs_b->throttled_cfs_rq.next)
+@@ -5604,11 +5615,11 @@
+ 
+ 	rcu_read_lock();
+ 	list_for_each_entry_rcu(tg, &task_groups, list) {
+-		struct cfs_bandwidth *cfs_b = &tg->cfs_bandwidth;
++		struct cfs_bw_state *cfs_b = tg_cfs_bandwidth(tg);
+ 		struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+ 
+ 		raw_spin_lock(&cfs_b->lock);
+-		cfs_rq->runtime_enabled = cfs_b->quota != RUNTIME_INF;
++		cfs_bw_rq(cfs_rq)->runtime_enabled = cfs_b->quota != RUNTIME_INF;
+ 		raw_spin_unlock(&cfs_b->lock);
+ 	}
+ 	rcu_read_unlock();
+@@ -5625,19 +5636,19 @@
+ 	list_for_each_entry_rcu(tg, &task_groups, list) {
+ 		struct cfs_rq *cfs_rq = tg->cfs_rq[cpu_of(rq)];
+ 
+-		if (!cfs_rq->runtime_enabled)
++		if (!cfs_bw_rq(cfs_rq)->runtime_enabled)
+ 			continue;
+ 
+ 		/*
+ 		 * clock_task is not advancing so we just need to make sure
+ 		 * there's some valid quota amount
+ 		 */
+-		cfs_rq->runtime_remaining = 1;
++		cfs_bw_rq(cfs_rq)->runtime_remaining = 1;
+ 		/*
+ 		 * Offline rq is schedulable till CPU is completely disabled
+ 		 * in take_cpu_down(), so we prevent new cfs throttling here.
+ 		 */
+-		cfs_rq->runtime_enabled = 0;
++		cfs_bw_rq(cfs_rq)->runtime_enabled = 0;
+ 
+ 		if (cfs_rq_throttled(cfs_rq))
+ 			unthrottle_cfs_rq(cfs_rq);
+@@ -5674,17 +5685,14 @@
+ 	return 0;
+ }
+ 
+-void init_cfs_bandwidth(struct cfs_bandwidth *cfs_b) {}
++bool alloc_cfs_bandwidth(struct task_group *tg, gfp_t flags) { return true; }
++void free_cfs_bandwidth(struct task_group *tg) {}
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED
+ static void init_cfs_rq_runtime(struct cfs_rq *cfs_rq) {}
+ #endif
+ 
+-static inline struct cfs_bandwidth *tg_cfs_bandwidth(struct task_group *tg)
+-{
+-	return NULL;
+-}
+-static inline void destroy_cfs_bandwidth(struct cfs_bandwidth *cfs_b) {}
++static inline void destroy_cfs_bandwidth(struct cfs_bw_state *cfs_b) {}
+ static inline void update_runtime_enabled(struct rq *rq) {}
+ static inline void unthrottle_offline_cfs_rqs(struct rq *rq) {}
+ 
+@@ -11758,6 +11766,7 @@
+ 			kfree(tg->se[i]);
+ 	}
+ 
++	free_cfs_bandwidth(tg);
+ 	kfree(tg->cfs_rq);
+ 	kfree(tg->se);
+ }
+@@ -11777,7 +11786,8 @@
+ 
+ 	tg->shares = NICE_0_LOAD;
+ 
+-	init_cfs_bandwidth(tg_cfs_bandwidth(tg));
++	if (!alloc_cfs_bandwidth(tg, GFP_KERNEL))
++		goto err;
+ 
+ 	for_each_possible_cpu(i) {
+ 		cfs_rq = kzalloc_node(sizeof(struct cfs_rq),
+--- a/kernel/sched/pelt.h
++++ b/kernel/sched/pelt.h
+@@ -151,10 +151,10 @@
+ /* rq->task_clock normalized against any time this cfs_rq has spent throttled */
+ static inline u64 cfs_rq_clock_pelt(struct cfs_rq *cfs_rq)
+ {
+-	if (unlikely(cfs_rq->throttle_count))
+-		return cfs_rq->throttled_clock_pelt - cfs_rq->throttled_clock_pelt_time;
+-
+-	return rq_clock_pelt(rq_of(cfs_rq)) - cfs_rq->throttled_clock_pelt_time;
++	if (unlikely(cfs_bw_rq(cfs_rq)->throttle_count))
++		return cfs_bw_rq(cfs_rq)->throttled_clock_pelt - cfs_bw_rq(cfs_rq)->throttled_clock_pelt_time;
++
++	return rq_clock_pelt(rq_of(cfs_rq)) - cfs_bw_rq(cfs_rq)->throttled_clock_pelt_time;
+ }
+ #else
+ static inline u64 cfs_rq_clock_pelt(struct cfs_rq *cfs_rq)
+--- a/kernel/sched/debug.c
++++ b/kernel/sched/debug.c
+@@ -643,9 +643,9 @@
+ #endif
+ #ifdef CONFIG_CFS_BANDWIDTH
+ 	SEQ_printf(m, "  .%-30s: %d\n", "throttled",
+-			cfs_rq->throttled);
++			cfs_bw_rq(cfs_rq)->throttled);
+ 	SEQ_printf(m, "  .%-30s: %d\n", "throttle_count",
+-			cfs_rq->throttle_count);
++			cfs_bw_rq(cfs_rq)->throttle_count);
+ #endif
+ 
+ #ifdef CONFIG_FAIR_GROUP_SCHED

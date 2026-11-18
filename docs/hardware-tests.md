@@ -17,4 +17,17 @@ Run the checks first on the original kernel to establish what works with the dev
 | Power and thermal | Check charging, temperature under normal load, and repeated screen-off suspend and resume. |
 | Linux runtimes | Run the [kernel discovery report](../README.md), then test each intended chroot or container runtime separately. |
 
-All checks other than stock-kernel ADB connectivity remain Not run for this project milestone.
+## PID-controller build on W1WEOS36.48-22-3-3-4-2
+
+Android completed boot on `vegas26` with kernel `5.15.180`. ADB transferred a file over USB and read back identical bytes. Wi-Fi was associated and Debian passed DNS and APT download checks. Android reported external USB power.
+
+The display compositor and audio service responded, cameras were enumerated, and Android reported a GNSS provider. The phone operator reported that touch and rotation, both cameras, microphone and speakers, Bluetooth pairing, fingerprint, GPS fix, cellular data, calls and texts, and screen-off suspend and wake appeared to work. Separate 4G and 5G checks, MMS and VoLTE, GPU and media workloads, USB accessories and tethering, and sustained thermal testing remain pending.
+
+## CFS Bandwidth and Container Networking build on W1WEOS36.48-22-3-3-4-2
+
+Android completed boot on slot A on `vegas26` with kernel release `5.15.180 #1 SMP PREEMPT Wed Nov 18 12:57:38 MST 2026`. Fastboot flashed only `boot_a` after preflight verified product, slot, and partition size matching the verified 64 MiB backup.
+
+- **Integrity**: `sys.boot_completed=1`, SELinux stayed enforcing, root worked, and all 360 vendor modules loaded with 0 dmesg symbol errors or loader warnings.
+- **CFS Bandwidth**: `/dev/cpuctl/cfs-hardware-test` applied a 10% CPU bandwidth quota (10,000 us per 100,000 us period) across two busy workers pinned to CPU 0 and CPU 1 via toybox `taskset`. The test observed 20/20 throttled periods and 3.69 seconds of accumulated throttled time (`CFS_HARDWARE_THROTTLE_PASS`).
+- **Container Networking**: `tests/test-container-bridge.sh` injected table `main` lookup into policy routing (`ip rule add from all lookup main pref 9999`) and verified bidirectional packet transmission between two container namespaces across bridge `br-test0` (0.14 - 0.21 ms latency, 0% packet loss), gateway ping, and iptables NAT MASQUERADE (`CONTAINER_NETWORKING_PASS`).
+- **Runtimes & Subsystems**: All 17 checks in the Debian 13 ARM64 regression suite passed. Bidirectional VXLAN packet transmission between isolated network namespaces passed. Display, battery (100%, 24°C), audio, 3 camera sensors, Wi-Fi, and real-time motion/orientation sensors remained fully functional.

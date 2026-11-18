@@ -1,0 +1,77 @@
+--- a/include/net/netprio_cgroup.h
++++ b/include/net/netprio_cgroup.h
+@@ -12,13 +12,15 @@
+ #include <linux/hardirq.h>
+ #include <linux/rcupdate.h>
+ 
+-#if IS_ENABLED(CONFIG_CGROUP_NET_PRIO)
++#if IS_ENABLED(CONFIG_CGROUP_NET_PRIO) || defined(MOTO_PIDS_LEGACY_SLOT)
+ struct netprio_map {
+ 	struct rcu_head rcu;
+ 	u32 priomap_len;
+ 	u32 priomap[];
+ };
++#endif
+ 
++#if IS_ENABLED(CONFIG_CGROUP_NET_PRIO)
+ static inline u32 task_netprioidx(struct task_struct *p)
+ {
+ 	struct cgroup_subsys_state *css;
+--- a/include/linux/cgroup-defs.h
++++ b/include/linux/cgroup-defs.h
+@@ -41,9 +41,14 @@
+ /* define the enumeration of all cgroup subsystems */
+ #define SUBSYS(_x) _x ## _cgrp_id,
+ enum cgroup_subsys_id {
++#define CGROUP_SUBSYS_ENUM
+ #include <linux/cgroup_subsys.h>
++#undef CGROUP_SUBSYS_ENUM
+ 	CGROUP_SUBSYS_COUNT,
+ };
++#ifdef MOTO_PIDS_LEGACY_SLOT
++#define pids_cgrp_id net_prio_cgrp_id
++#endif
+ #undef SUBSYS
+ 
+ /* bits in struct cgroup_subsys_state flags field */
+@@ -764,7 +769,7 @@
+ #ifdef CONFIG_CGROUP_NET_CLASSID
+ 	u32		classid; /* v1 */
+ #endif
+-#ifdef CONFIG_CGROUP_NET_PRIO
++#if defined(CONFIG_CGROUP_NET_PRIO) || defined(MOTO_PIDS_LEGACY_SLOT)
+ 	u16		prioidx; /* v1 */
+ #endif
+ };
+--- a/include/linux/cgroup_subsys.h
++++ b/include/linux/cgroup_subsys.h
+@@ -47,13 +47,17 @@
+ 
+ #if IS_ENABLED(CONFIG_CGROUP_NET_PRIO)
+ SUBSYS(net_prio)
++#elif defined(MOTO_PIDS_LEGACY_SLOT) && defined(CGROUP_SUBSYS_ENUM)
++/* Keep the old numeric slot in the vendor-visible enum. */
++SUBSYS(net_prio)
+ #endif
+ 
+ #if IS_ENABLED(CONFIG_CGROUP_HUGETLB)
+ SUBSYS(hugetlb)
+ #endif
+ 
+-#if IS_ENABLED(CONFIG_CGROUP_PIDS)
++#if IS_ENABLED(CONFIG_CGROUP_PIDS) && \
++	!(defined(MOTO_PIDS_LEGACY_SLOT) && defined(CGROUP_SUBSYS_ENUM))
+ SUBSYS(pids)
+ #endif
+ 
+--- a/include/linux/netdevice.h
++++ b/include/linux/netdevice.h
+@@ -2289,7 +2289,7 @@
+ #if IS_ENABLED(CONFIG_FCOE)
+ 	unsigned int		fcoe_ddp_xid;
+ #endif
+-#if IS_ENABLED(CONFIG_CGROUP_NET_PRIO)
++#if IS_ENABLED(CONFIG_CGROUP_NET_PRIO) || defined(MOTO_PIDS_LEGACY_SLOT)
+ 	struct netprio_map __rcu *priomap;
+ #endif
+ 	struct phy_device	*phydev;
