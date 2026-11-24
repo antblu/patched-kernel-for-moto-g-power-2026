@@ -28,3 +28,4 @@ build/
 dist/
 tmp/
 __pycache__/
+verizon-debranding/

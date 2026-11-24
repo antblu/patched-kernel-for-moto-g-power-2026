@@ -7,6 +7,7 @@ Tested only on the Moto G Power 2026 (vegas26), Android 16 firmware `W1WEOS36.48
 1. [Build the namespace kernel](docs/building.md) and check the vendor module CRCs.
 2. [Prepare the boot image, verify stock recovery, and install](docs/recovery.md).
 3. [Download Debian, set up automatic startup, and enter its shell](docs/debian.md).
+4. [Replicate Verizon boot debranding on XT2617V devices](docs/verizon-debranding.md).
 
 ```sh
 python3 scripts/install-debian.py
