@@ -1,0 +1,28 @@
+diff --git a/native/src/init/rootdir.cpp b/native/src/init/rootdir.cpp
+--- a/native/src/init/rootdir.cpp
++++ b/native/src/init/rootdir.cpp
+@@ -63,6 +63,15 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool writ
+     {
+         owned_fd src_rc = xopenat(src_fd, INIT_RC, O_RDONLY | O_CLOEXEC, 0);
+         if (src_rc < 0) return false;
++        owned_fd policy_rc = -1;
++        if (!writable && string_view(src_path) == NEW_INITRC_DIR) {
++            // patch_ro_root placed this file in our working directory.
++            if (access("vegas26-init.rc.in", F_OK) == 0) {
++                policy_rc = xopen("vegas26-init.rc.in", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++                if (policy_rc < 0) return false;
++                LOGD("Using vegas26 init policy input\n");
++            }
++        }
+         if (writable) unlinkat(src_fd, INIT_RC, 0);
+         auto dest_rc = xopen_file(
+                 xopenat(dest_fd, INIT_RC, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
+@@ -70,6 +79,7 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool writ
+         if (!dest_rc) return false;
+         LOGD("Patching " INIT_RC " in %s\n", src_path);
+-        file_readline(src_rc, [&dest_rc](Utf8CStr line) -> bool {
++        int input = policy_rc >= 0 ? int(policy_rc) : int(src_rc);
++        file_readline(input, [&dest_rc](Utf8CStr line) -> bool {
+             // Do not start vaultkeeper
+             if (line.sv().contains("start vaultkeeper")) {
+                 LOGD("Remove vaultkeeper\n");

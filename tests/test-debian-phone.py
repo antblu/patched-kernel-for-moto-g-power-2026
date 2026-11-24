@@ -19,6 +19,10 @@ TESTS = {
     "device nodes": "test -c /dev/null && head -c 1 /dev/urandom >/dev/null",
     "private PTY": "script -qec 'test -t 0 && test -t 1' /dev/null",
     "shared memory directory": 'test "$(stat -c %a /dev/shm)" = 1777 && test -w /dev/shm',
+    "unified cgroup mount": (
+        'test "$(stat -f -c %T /sys/fs/cgroup)" = cgroup2fs && '
+        'test -r /sys/fs/cgroup/cgroup.controllers'
+    ),
     "DNS": "getent ahostsv4 deb.debian.org >/dev/null",
     "APT package indexes": "apt-get -o APT::Update::Error-Mode=any update >/dev/null",
     "APT-installed init package": "dpkg-query -W tini >/dev/null",

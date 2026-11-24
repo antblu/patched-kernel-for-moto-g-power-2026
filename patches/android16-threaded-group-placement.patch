@@ -1,0 +1,406 @@
+diff --git a/libprocessgroup/processgroup.cpp b/libprocessgroup/processgroup.cpp
+index 62e978c..ff3f0cf 100644
+--- a/libprocessgroup/processgroup.cpp
++++ b/libprocessgroup/processgroup.cpp
+@@ -388,20 +388,12 @@ void removeAllEmptyProcessGroups() {
+  * the user root. Ownership for the newly created cgroup and all of its files must thus be
+  * transferred for the user/group passed as uid/gid before system_server can properly access them.
+  */
+-static bool MkdirAndChown(const std::string& path, mode_t mode, uid_t uid, gid_t gid) {
+-    if (mkdir(path.c_str(), mode) == -1) {
+-        if (errno == EEXIST) {
+-            // Directory already exists and permissions have been set at the time it was created
+-            return true;
+-        }
+-        return false;
+-    }
+-
++static bool ChownCgroupFiles(const std::string& path, mode_t mode, uid_t uid, gid_t gid) {
+     auto dir = std::unique_ptr<DIR, decltype(&closedir)>(opendir(path.c_str()), closedir);
+ 
+     if (dir == NULL) {
+         PLOG(ERROR) << "opendir failed for " << path;
+-        goto err;
++        return false;
+     }
+ 
+     struct dirent* dir_entry;
+@@ -414,17 +406,24 @@ static bool MkdirAndChown(const std::string& path, mode_t mode, uid_t uid, gid_t
+ 
+         if (lchown(file_path.c_str(), uid, gid) < 0) {
+             PLOG(ERROR) << "lchown failed for " << file_path;
+-            goto err;
++            return false;
+         }
+ 
+         if (fchmodat(AT_FDCWD, file_path.c_str(), mode, AT_SYMLINK_NOFOLLOW) != 0) {
+             PLOG(ERROR) << "fchmodat failed for " << file_path;
+-            goto err;
++            return false;
+         }
+     }
+-
+     return true;
+-err:
++}
++
++static bool MkdirAndChown(const std::string& path, mode_t mode, uid_t uid, gid_t gid) {
++    if (mkdir(path.c_str(), mode) == -1) {
++        return errno == EEXIST;
++    }
++    if (ChownCgroupFiles(path, mode, uid, gid)) {
++        return true;
++    }
+     int saved_errno = errno;
+     rmdir(path.c_str());
+     errno = saved_errno;
+@@ -432,6 +431,20 @@ err:
+     return false;
+ }
+ 
++static bool InitializeVegas26Scheduling(const std::string& process, mode_t mode, uid_t uid,
++                                        gid_t gid) {
++    const auto scheduler = process + "/vegas26-sched";
++    if (mkdir(scheduler.c_str(), mode) < 0 && errno != EEXIST) {
++        return false;
++    }
++    // Convert the child first so the process cgroup remains the resource domain
++    // when it enables the threaded controllers and receives the initial process.
++    return WriteStringToFile("threaded", scheduler + "/cgroup.type") &&
++           WriteStringToFile("+cpu +cpuset", process + "/cgroup.subtree_control") &&
++           WriteStringToFile("+cpu +cpuset", scheduler + "/cgroup.subtree_control") &&
++           ChownCgroupFiles(scheduler, mode, uid, gid);
++}
++
+ bool sendSignalToProcessGroup(uid_t uid, pid_t initialPid, int signal) {
+     std::set<pid_t> pgids, pids;
+ 
+@@ -744,6 +757,19 @@ static int createProcessGroupInternal(uid_t uid, pid_t initialPid, std::string c
+         return -errno;
+     }
+ 
++    if (activate_controllers) {
++        auto& map = CgroupMap::GetInstance();
++        const auto cpu = map.FindController("cpu");
++        const auto cpuset = map.FindController("cpuset");
++        if (cpu.HasValue() && cpu.version() == 2 && cpuset.HasValue() && cpuset.version() == 2 &&
++            !InitializeVegas26Scheduling(uid_pid_path, cgroup_mode, cgroup_uid, cgroup_gid)) {
++            const int setup_error = errno;
++            PLOG(ERROR) << "Failed to initialize threaded scheduling for " << uid_pid_path;
++            RemoveProcessGroupDirectory(uid_pid_path, true);
++            return -setup_error;
++        }
++    }
++
+     auto uid_pid_procs_file = uid_pid_path + '/' + PROCESSGROUP_CGROUP_PROCS_FILE;
+ 
+     if (!WriteStringToFile(std::to_string(initialPid), uid_pid_procs_file)) {
+diff --git a/libprocessgroup/sched_policy.cpp b/libprocessgroup/sched_policy.cpp
+index 5a53c35..4bbfce7 100644
+--- a/libprocessgroup/sched_policy.cpp
++++ b/libprocessgroup/sched_policy.cpp
+@@ -160,6 +160,25 @@ static int getCGroupSubsys(pid_t tid, const char* subsys, std::string& subgroup)
+     if (!controller.GetTaskGroup(tid, &subgroup))
+         return -1;
+ 
++    if (controller.version() == 2) {
++        constexpr std::string_view marker = "/vegas26-sched/";
++        const size_t start = subgroup.find(marker);
++        if (start == std::string::npos) {
++            subgroup.clear();
++            return 0;
++        }
++        subgroup.erase(0, start + marker.size());
++        const size_t separator = subgroup.find('/');
++        if (std::string_view(subsys) == "cpu") {
++            if (separator != std::string::npos) subgroup.resize(separator);
++        } else if (separator != std::string::npos) {
++            subgroup.erase(0, separator + 1);
++        } else {
++            subgroup.clear();
++        }
++        if (subgroup == "default") subgroup.clear();
++    }
++
+     return 0;
+ }
+ 
+diff --git a/libprocessgroup/task_profiles.cpp b/libprocessgroup/task_profiles.cpp
+index c87f744..a79d00f 100644
+--- a/libprocessgroup/task_profiles.cpp
++++ b/libprocessgroup/task_profiles.cpp
+@@ -19,13 +19,16 @@
+ 
+ #include <task_profiles.h>
+ 
++#include <algorithm>
+ #include <map>
+ #include <string>
+ 
+ #include <dirent.h>
+ #include <fcntl.h>
+ #include <sched.h>
++#include <sys/file.h>
+ #include <sys/resource.h>
++#include <sys/stat.h>
+ #include <unistd.h>
+ 
+ #include <android-base/file.h>
+@@ -157,6 +160,9 @@ std::string ConvertUidPidToPath(const char* root_cgroup_path, uid_t uid, pid_t p
+ }
+ 
+ bool ProfileAttribute::GetPathForProcess(uid_t uid, pid_t pid, std::string* path) const {
++    if (controller()->version() == 2 && std::string_view(controller()->name()) == "cpu") {
++        return GetPathForTask(pid, path);
++    }
+     if (controller()->version() == 2) {
+         const std::string cgroup_path = ConvertUidPidToPath(controller()->path(), uid, pid, true);
+         *path = cgroup_path + "/" + file_name();
+@@ -175,17 +181,22 @@ bool ProfileAttribute::GetPathForTask(pid_t tid, std::string* path) const {
+         return true;
+     }
+ 
+-    // The CPU scheduling subtree is threaded. Memory and I/O attributes
+-    // belong to the enclosing process domain even when the caller names a TID.
+-    if (controller()->version() == 2 &&
+-        (std::string_view(controller()->name()) == "memory" ||
+-         std::string_view(controller()->name()) == "io")) {
++    // CPU controls live at the class level, cpuset at the affinity leaf, and
++    // memory, freezer and I/O controls at the enclosing process domain.
++    if (controller()->version() == 2) {
++        const std::string_view name(controller()->name());
+         constexpr std::string_view scheduling_group = "/vegas26-sched";
+         const size_t boundary = subgroup.find(scheduling_group);
+         if (boundary != std::string::npos &&
+             (boundary + scheduling_group.size() == subgroup.size() ||
+              subgroup[boundary + scheduling_group.size()] == '/')) {
+-            subgroup.resize(boundary);
++            if (name == "memory" || name == "io" || name == "freezer" ||
++                (name == "cgroup2" && file_name() == "cgroup.procs")) {
++                subgroup.resize(boundary);
++            } else if (name == "cpu") {
++                const size_t affinity = subgroup.find('/', boundary + scheduling_group.size() + 1);
++                if (affinity != std::string::npos) subgroup.resize(affinity);
++            }
+         }
+     }
+ 
+@@ -313,6 +324,146 @@ bool SetAttributeAction::IsValidForTask(pid_t tid) const {
+     return optional_;
+ }
+ 
++namespace {
++
++constexpr std::string_view kSchedulingDirectory = "vegas26-sched";
++
++int Vegas26CpuWeight(std::string_view name) {
++    if (name == "foreground") return 400;
++    if (name == "top-app") return 500;
++    for (const std::string_view group : {"default", "background", "camera-daemon", "dex2oat",
++                                        "foreground_window", "nnapi-hal", "rt", "system",
++                                        "system-background"}) {
++        if (name == group) return 100;
++    }
++    return 0;
++}
++
++const char* Vegas26AffinityMask(std::string_view name) {
++    if (name == "default") return "";
++    if (name == "background" || name == "system-background" || name == "restricted") return "0-3";
++    if (name == "boost-app") return "1-7";
++    if (name == "foreground" || name == "h-background") return "0-6";
++    if (name == "foreground_window" || name == "top-app" || name == "camera-daemon" ||
++        name == "h-foreground") {
++        return "0-7";
++    }
++    return nullptr;
++}
++
++struct Vegas26Placement {
++    std::string scheduler;
++    std::string cpu = "default";
++    std::string affinity = "default";
++};
++
++bool ReadVegas26Placement(const CgroupControllerWrapper& controller, pid_t tid,
++                          Vegas26Placement* placement) {
++    std::string group;
++    if (!controller.GetTaskGroup(tid, &group) || group.empty()) return false;
++
++    const std::string marker = "/" + std::string(kSchedulingDirectory);
++    const size_t scheduler = group.find(marker);
++    if (scheduler == std::string::npos) {
++        placement->scheduler = std::string(controller.path()) + "/" + group + marker;
++        return true;
++    }
++
++    const size_t end = scheduler + marker.size();
++    placement->scheduler = std::string(controller.path()) + "/" + group.substr(0, end);
++    if (end == group.size()) return true;
++    if (group[end] != '/') return false;
++
++    const size_t affinity = group.find('/', end + 1);
++    placement->cpu = group.substr(end + 1, affinity == std::string::npos ? affinity
++                                                                         : affinity - end - 1);
++    if (affinity != std::string::npos) placement->affinity = group.substr(affinity + 1);
++    return Vegas26CpuWeight(placement->cpu) != 0 && Vegas26AffinityMask(placement->affinity);
++}
++
++bool OwnVegas26SchedulingGroup(const std::string& group, const struct stat& owner) {
++    for (const char* file : {"", "/cgroup.threads", "/cgroup.subtree_control"}) {
++        const auto path = group + file;
++        if (geteuid() == 0 && chown(path.c_str(), owner.st_uid, owner.st_gid) < 0) return false;
++    }
++    return true;
++}
++
++bool ApplyVegas26Scheduling(const CgroupControllerWrapper& controller, pid_t tid,
++                            const std::string& category) {
++    const bool cpu = std::string_view(controller.name()) == "cpu";
++    const std::string name = category.empty() ? "default" : category;
++    if (cpu ? Vegas26CpuWeight(name) == 0 : Vegas26AffinityMask(name) == nullptr) {
++        errno = EINVAL;
++        return false;
++    }
++
++    Vegas26Placement original;
++    if (!ReadVegas26Placement(controller, tid, &original)) return false;
++    unique_fd lock(TEMP_FAILURE_RETRY(open(original.scheduler.c_str(), O_RDONLY | O_DIRECTORY |
++                                                                         O_CLOEXEC | O_NOFOLLOW)));
++    if (lock < 0 || TEMP_FAILURE_RETRY(flock(lock.get(), LOCK_EX)) < 0) return false;
++    struct stat owner;
++    if (fstat(lock.get(), &owner) < 0) return false;
++
++    Vegas26Placement placement;
++    if (!ReadVegas26Placement(controller, tid, &placement) ||
++        original.scheduler != placement.scheduler) {
++        return false;
++    }
++    (cpu ? placement.cpu : placement.affinity) = name;
++
++    const auto cpu_group = placement.scheduler + "/" + placement.cpu;
++    if (mkdir(cpu_group.c_str(), 0750) == 0) {
++        if (!WriteStringToFile("threaded", cpu_group + "/cgroup.type") ||
++            !WriteStringToFile(std::to_string(Vegas26CpuWeight(placement.cpu)),
++                               cpu_group + "/cpu.weight") ||
++            !WriteStringToFile("+cpuset", cpu_group + "/cgroup.subtree_control") ||
++            (placement.cpu == "nnapi-hal" &&
++             (!WriteStringToFile("1.00", cpu_group + "/cpu.uclamp.min") ||
++              !WriteStringToFile("1", cpu_group + "/cpu.uclamp.latency_sensitive"))) ||
++            !OwnVegas26SchedulingGroup(cpu_group, owner)) {
++            const int error = errno;
++            rmdir(cpu_group.c_str());
++            errno = error;
++            return false;
++        }
++    } else if (errno != EEXIST) {
++        return false;
++    }
++
++    const auto affinity_group = cpu_group + "/" + placement.affinity;
++    if (mkdir(affinity_group.c_str(), 0750) == 0) {
++        std::string mask(Vegas26AffinityMask(placement.affinity));
++        std::string live_mask;
++        if (placement.affinity == "top-app" &&
++            android::base::ReadFileToString("/dev/cpuset/top-app/cpus", &live_mask)) {
++            live_mask = android::base::Trim(live_mask);
++            if (!live_mask.empty() &&
++                std::all_of(live_mask.begin(), live_mask.end(), [](char c) {
++                    return (c >= '0' && c <= '7') || c == '-' || c == ',';
++                })) {
++                mask = live_mask;
++            }
++        }
++        if (!WriteStringToFile("threaded", affinity_group + "/cgroup.type") ||
++            (!mask.empty() && !WriteStringToFile(mask, affinity_group + "/cpuset.cpus")) ||
++            !OwnVegas26SchedulingGroup(affinity_group, owner)) {
++            const int error = errno;
++            rmdir(affinity_group.c_str());
++            errno = error;
++            return false;
++        }
++    } else if (errno != EEXIST) {
++        return false;
++    }
++
++    return WriteStringToFile(std::to_string(tid), affinity_group + "/cgroup.threads") ||
++           errno == ESRCH;
++}
++
++}  // namespace
++
+ SetCgroupAction::SetCgroupAction(const CgroupControllerWrapper& c, const std::string& p)
+     : controller_(c), path_(p) {
+     FdCacheHelper::Init(controller_.GetTasksFilePath(path_), fd_[ProfileAction::RCT_TASK]);
+@@ -385,6 +536,21 @@ ProfileAction::CacheUseResult SetCgroupAction::UseCachedFd(ResourceCacheType cac
+ }
+ 
+ bool SetCgroupAction::ExecuteForProcess(uid_t uid, pid_t pid) const {
++    if (controller_.version() == 2) {
++        const auto path = StringPrintf("/proc/%d/task", pid);
++        const auto close_directory = [](DIR* directory) { closedir(directory); };
++        std::unique_ptr<DIR, decltype(close_directory)> tasks(opendir(path.c_str()),
++                                                            close_directory);
++        if (!tasks) return errno == ENOENT;
++        while (const dirent* entry = readdir(tasks.get())) {
++            pid_t tid;
++            if (android::base::ParseInt(entry->d_name, &tid, 1) &&
++                !ExecuteForTask(tid) && access(StringPrintf("/proc/%d", tid).c_str(), F_OK) == 0) {
++                return false;
++            }
++        }
++        return true;
++    }
+     CacheUseResult result = UseCachedFd(ProfileAction::RCT_PROCESS, pid);
+     if (result != ProfileAction::UNUSED) {
+         return result == ProfileAction::SUCCESS;
+@@ -406,6 +572,9 @@ bool SetCgroupAction::ExecuteForProcess(uid_t uid, pid_t pid) const {
+ }
+ 
+ bool SetCgroupAction::ExecuteForTask(pid_t tid) const {
++    if (controller_.version() == 2) {
++        return ApplyVegas26Scheduling(controller_, tid, path_);
++    }
+     CacheUseResult result = UseCachedFd(ProfileAction::RCT_TASK, tid);
+     if (result != ProfileAction::UNUSED) {
+         return result == ProfileAction::SUCCESS;
+@@ -427,6 +596,7 @@ bool SetCgroupAction::ExecuteForTask(pid_t tid) const {
+ }
+ 
+ void SetCgroupAction::EnableResourceCaching(ResourceCacheType cache_type) {
++    if (controller_.version() == 2) return;
+     std::lock_guard<std::mutex> lock(fd_mutex_);
+     // Return early to prevent unnecessary calls to controller_.Get{Tasks|Procs}FilePath() which
+     // include regex evaluations
+@@ -453,6 +623,7 @@ void SetCgroupAction::DropResourceCaching(ResourceCacheType cache_type) {
+ }
+ 
+ bool SetCgroupAction::IsValidForProcess(uid_t uid, pid_t pid) const {
++    if (controller_.version() == 2) return IsValidForTask(pid);
+     std::lock_guard<std::mutex> lock(fd_mutex_);
+     if (FdCacheHelper::IsCached(fd_[ProfileAction::RCT_PROCESS])) {
+         return true;
+@@ -466,7 +637,12 @@ bool SetCgroupAction::IsValidForProcess(uid_t uid, pid_t pid) const {
+     return access(procs_path.c_str(), W_OK) == 0;
+ }
+ 
+-bool SetCgroupAction::IsValidForTask(int) const {
++bool SetCgroupAction::IsValidForTask(int tid) const {
++    if (controller_.version() == 2) {
++        Vegas26Placement placement;
++        return ReadVegas26Placement(controller_, tid, &placement) &&
++               access(placement.scheduler.c_str(), W_OK) == 0;
++    }
+     std::lock_guard<std::mutex> lock(fd_mutex_);
+     if (FdCacheHelper::IsCached(fd_[ProfileAction::RCT_TASK])) {
+         return true;
+@@ -923,7 +1099,8 @@ bool TaskProfiles::Load(const CgroupMap& cg_map, const std::string& file_name) {
+ 
+                 auto controller = cg_map.FindController(controller_name);
+                 if (controller.HasValue()) {
+-                    if (controller.version() == 1) {
++                    if (controller.version() == 1 || controller_name == "cpu" ||
++                        controller_name == "cpuset") {
+                         profile->Add(std::make_unique<SetCgroupAction>(controller, path));
+                     } else {
+                         LOG(WARNING) << "A JoinCgroup action in the " << profile_name

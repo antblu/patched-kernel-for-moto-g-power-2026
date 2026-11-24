@@ -1,0 +1,111 @@
+diff --git a/libprocessgroup/processgroup.cpp b/libprocessgroup/processgroup.cpp
+index a8fa50a..62e978c 100644
+--- a/libprocessgroup/processgroup.cpp
++++ b/libprocessgroup/processgroup.cpp
+@@ -242,9 +242,61 @@ bool SetUserProfiles(uid_t uid, const std::vector<std::string>& profiles) {
+                                                        false);
+ }
+ 
++// Only remove descendants under the scheduler-owned directory. Other children
++// must keep the stock behaviour of preventing the process group from being removed.
++static int RemoveSchedulingSubtree(const std::string& path) {
++    const auto close_directory = [](DIR* directory) { closedir(directory); };
++    std::unique_ptr<DIR, decltype(close_directory)> children(opendir(path.c_str()), close_directory);
++    if (!children) {
++        return errno == ENOENT ? 0 : -1;
++    }
++
++    while (true) {
++        errno = 0;
++        const dirent* child = readdir(children.get());
++        if (!child) {
++            if (errno != 0) {
++                return -1;
++            }
++            break;
++        }
++        const std::string_view name(child->d_name);
++        if (child->d_type != DT_DIR || name == "." || name == "..") {
++            continue;
++        }
++        if (RemoveSchedulingSubtree(path + "/" + child->d_name) < 0) {
++            return -1;
++        }
++    }
++    if (TEMP_FAILURE_RETRY(rmdir(path.c_str())) < 0 && errno != ENOENT) {
++        return -1;
++    }
++    return 0;
++}
++
++static int RemoveProcessGroupDirectory(const std::string& path, bool v2_path) {
++    const auto scheduling_path = path + "/vegas26-sched";
++    if (v2_path && access(scheduling_path.c_str(), F_OK) == 0) {
++        std::string events;
++        if (!android::base::ReadFileToString(path + "/" + PROCESSGROUP_CGROUP_EVENTS_FILE,
++                                            &events)) {
++            return -1;
++        }
++        if (!events.starts_with("populated 0\n") &&
++            events.find("\npopulated 0\n") == std::string::npos) {
++            errno = EBUSY;
++            return -1;
++        }
++        if (RemoveSchedulingSubtree(scheduling_path) < 0) {
++            return -1;
++        }
++    }
++    return TEMP_FAILURE_RETRY(rmdir(path.c_str()));
++}
++
+ static int RemoveCgroup(const char* cgroup, uid_t uid, pid_t pid, bool v2_path) {
+     auto path = ConvertUidPidToPath(cgroup, uid, pid, v2_path);
+-    int ret = TEMP_FAILURE_RETRY(rmdir(path.c_str()));
++    int ret = RemoveProcessGroupDirectory(path, v2_path);
+ 
+     if (!ret && uid >= AID_ISOLATED_START && uid <= AID_ISOLATED_END) {
+         // Isolated UIDs are unlikely to be reused soon after removal,
+@@ -262,7 +314,7 @@ static int RemoveCgroup(const char* cgroup, uid_t uid, pid_t pid, bool v2_path)
+     return ret;
+ }
+ 
+-static bool RemoveEmptyUidCgroups(const std::string& uid_path) {
++static bool RemoveEmptyUidCgroups(const std::string& uid_path, bool v2_path) {
+     std::unique_ptr<DIR, decltype(&closedir)> uid(opendir(uid_path.c_str()), closedir);
+     bool empty = true;
+     if (uid != NULL) {
+@@ -278,7 +330,7 @@ static bool RemoveEmptyUidCgroups(const std::string& uid_path) {
+ 
+             auto path = StringPrintf("%s/%s", uid_path.c_str(), dir->d_name);
+             LOG(VERBOSE) << "Removing " << path;
+-            if (rmdir(path.c_str()) == -1) {
++            if (RemoveProcessGroupDirectory(path, v2_path) == -1) {
+                 if (errno != EBUSY) {
+                     PLOG(WARNING) << "Failed to remove " << path;
+                 }
+@@ -293,12 +345,12 @@ void removeAllEmptyProcessGroups() {
+     LOG(VERBOSE) << "removeAllEmptyProcessGroups()";
+ 
+     std::vector<std::string> cgroups;
+-    std::string path, memcg_apps_path;
++    std::string v2_root, memcg_apps_path;
+ 
+-    if (CgroupGetControllerPath(CGROUPV2_HIERARCHY_NAME, &path)) {
+-        cgroups.push_back(path);
++    if (CgroupGetControllerPath(CGROUPV2_HIERARCHY_NAME, &v2_root)) {
++        cgroups.push_back(v2_root);
+     }
+-    if (CgroupGetMemcgAppsPath(&memcg_apps_path) && memcg_apps_path != path) {
++    if (CgroupGetMemcgAppsPath(&memcg_apps_path) && memcg_apps_path != v2_root) {
+         cgroups.push_back(memcg_apps_path);
+     }
+ 
+@@ -318,7 +370,7 @@ void removeAllEmptyProcessGroups() {
+                 }
+ 
+                 auto path = StringPrintf("%s/%s", cgroup_root_path.c_str(), dir->d_name);
+-                if (!RemoveEmptyUidCgroups(path)) {
++                if (!RemoveEmptyUidCgroups(path, cgroup_root_path == v2_root)) {
+                     LOG(VERBOSE) << "Skip removing " << path;
+                     continue;
+                 }

@@ -1,0 +1,99 @@
+diff --git a/libprocessgroup/processgroup.cpp b/libprocessgroup/processgroup.cpp
+--- a/libprocessgroup/processgroup.cpp
++++ b/libprocessgroup/processgroup.cpp
+@@ -431,18 +431,35 @@
+     return false;
+ }
+ 
+-static bool InitializeVegas26Scheduling(const std::string& process, mode_t mode, uid_t uid,
+-                                        gid_t gid) {
++static void InitializeVegas26Scheduling(const std::string& process, mode_t mode, uid_t uid,
++                                         gid_t gid) {
+     const auto scheduler = process + "/vegas26-sched";
+-    if (mkdir(scheduler.c_str(), mode) < 0 && errno != EEXIST) {
+-        return false;
+-    }
+-    // Convert the child first so the process cgroup remains the resource domain
+-    // when it enables the threaded controllers and receives the initial process.
+-    return WriteStringToFile("threaded", scheduler + "/cgroup.type") &&
+-           WriteStringToFile("+cpu +cpuset", process + "/cgroup.subtree_control") &&
+-           WriteStringToFile("+cpu +cpuset", scheduler + "/cgroup.subtree_control") &&
+-           ChownCgroupFiles(scheduler, mode, uid, gid);
++    const bool created = mkdir(scheduler.c_str(), mode) == 0;
++    if (!created && errno != EEXIST) {
++        PLOG(WARNING) << "Cannot create scheduling cgroup " << scheduler;
++        return;
++    }
++
++    const auto write_control = [](const char* value, const std::string& path) {
++        if (WriteStringToFile(value, path)) return true;
++        PLOG(WARNING) << "Cannot write '" << value << "' to " << path;
++        return false;
++    };
++
++    // The process already belongs to its resource domain. Its empty scheduling
++    // child can become threaded while memory and I/O stay on the process group.
++    if (write_control("threaded", scheduler + "/cgroup.type") &&
++        write_control("+cpu +cpuset", process + "/cgroup.subtree_control") &&
++        write_control("+cpu +cpuset", scheduler + "/cgroup.subtree_control") &&
++        ChownCgroupFiles(scheduler, mode, uid, gid)) {
++        return;
++    }
++
++    // The process group also owns memory, I/O and lifecycle controls. A failure
++    // to apply a scheduling profile must not remove it or fail process startup.
++    if (created && TEMP_FAILURE_RETRY(rmdir(scheduler.c_str())) < 0 && errno != ENOENT) {
++        PLOG(WARNING) << "Cannot remove incomplete scheduling cgroup " << scheduler;
++    }
+ }
+ 
+ bool sendSignalToProcessGroup(uid_t uid, pid_t initialPid, int signal) {
+@@ -729,7 +746,6 @@
+     mode_t cgroup_mode = 0750;
+     uid_t cgroup_uid = AID_SYSTEM;
+     gid_t cgroup_gid = AID_SYSTEM;
+-    int ret = 0;
+ 
+     if (stat(cgroup.c_str(), &cgroup_stat) < 0) {
+         PLOG(ERROR) << "Failed to get stats for " << cgroup;
+@@ -757,27 +773,23 @@
+         return -errno;
+     }
+ 
++    const auto uid_pid_procs_file = uid_pid_path + '/' + PROCESSGROUP_CGROUP_PROCS_FILE;
++    if (!WriteStringToFile(std::to_string(initialPid), uid_pid_procs_file)) {
++        const int error = errno;
++        PLOG(ERROR) << "Failed to write '" << initialPid << "' to " << uid_pid_procs_file;
++        return -error;
++    }
++
+     if (activate_controllers) {
+         auto& map = CgroupMap::GetInstance();
+         const auto cpu = map.FindController("cpu");
+         const auto cpuset = map.FindController("cpuset");
+-        if (cpu.HasValue() && cpu.version() == 2 && cpuset.HasValue() && cpuset.version() == 2 &&
+-            !InitializeVegas26Scheduling(uid_pid_path, cgroup_mode, cgroup_uid, cgroup_gid)) {
+-            const int setup_error = errno;
+-            PLOG(ERROR) << "Failed to initialize threaded scheduling for " << uid_pid_path;
+-            RemoveProcessGroupDirectory(uid_pid_path, true);
+-            return -setup_error;
+-        }
+-    }
+-
+-    auto uid_pid_procs_file = uid_pid_path + '/' + PROCESSGROUP_CGROUP_PROCS_FILE;
+-
+-    if (!WriteStringToFile(std::to_string(initialPid), uid_pid_procs_file)) {
+-        ret = -errno;
+-        PLOG(ERROR) << "Failed to write '" << initialPid << "' to " << uid_pid_procs_file;
+-    }
+-
+-    return ret;
++        if (cpu.HasValue() && cpu.version() == 2 && cpuset.HasValue() && cpuset.version() == 2) {
++            InitializeVegas26Scheduling(uid_pid_path, cgroup_mode, cgroup_uid, cgroup_gid);
++        }
++    }
++
++    return 0;
+ }
+ 
+ int createProcessGroup(uid_t uid, pid_t initialPid, bool memControl) {

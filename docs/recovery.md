@@ -21,6 +21,14 @@ This procedure and its candidate image are specific to that device and firmware.
 
    Confirm Android boots on slot A and the stock partition still matches the digest. A/B slot health and a temporary boot path remain unverified on this firmware.
 
+On the tested unlocked phone, Fastboot accepted the matching stock `init_boot_a` during a separate rehearsal. Android booted with SELinux enforcing and Magisk root was absent. Fastboot preflash validation rejected the modified `init_boot_a` images tested earlier. A subsequent `fastboot boot` trial reported that the command was unimplemented and Android returned with a normal reboot.
+
+The standalone recovery builds passed the 202-module early-boot ABI audit and QEMU checks against synthetic GPT disks. The read-only probe checked the stock `init_boot_a` digest. The separate restore image wrote the saved ramdisk to a matching test partition and left a mismatched disk byte-for-byte intact. On the first hardware trial, Fastboot accepted the read-only `boot_a` image, but USB failed to reconnect. After manually re-entering the bootloader, Fastboot restored the known-good kernel and Android booted with SELinux enforcing.
+
+The corrected read-only probe resolved `modules.dep` before loading the vendor storage drivers. On the phone, it verified the exact stock `init_boot_a` digest and returned to the bootloader automatically. The retained kernel log recorded `INIT_BOOT_A_READ_PASS` before the reboot. The known-good Android kernel was then restored.
+
+The dependency-ordered restore image subsequently restored the saved rooted `init_boot_a` and returned to Fastboot. After reflashing the known-good `boot_a`, Android booted with SELinux enforcing. ADB verified `su` returned `uid=0` and the live `init_boot_a` SHA-256 matched the saved image. PIDs delegation and the `moto_swap` disablement also returned.
+
 3. From the repository checkout, package and inspect the namespace candidate using private paths.
 
    ```sh

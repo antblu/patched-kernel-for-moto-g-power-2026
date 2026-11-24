@@ -24,6 +24,10 @@ python3 tests/test-debian-phone.py
 
 The shell joins the Debian instance started during boot. To disable automatic startup, move `/data/adb/service.d/90-debian-trixie.sh` outside Magisk's service directory as root, then reboot Android.
 
+The updated boot launcher moves the Debian bind mount onto the root of its private mount namespace before starting `tini`. This is required for OCI exec, since joining a mount namespace resets the filesystem root to that namespace's root. A fresh Debian instance is required after updating the launcher.
+
+The launcher bind-mounts Android's unified hierarchy at Debian's `/sys/fs/cgroup`. After updating the launcher, restart the Debian instance to release any legacy hierarchies held by the previous instance. On the test phone, restarting released `pids` from v1 and exposed it on v2 in both Android and Debian. Android still owns CPU, cpuset, and memory on v1.
+
 ## Test results
 
 On the test phone, a fresh Android reboot started Debian automatically. The test suite verified Debian 13 ARM64, `tini` as PID 1, the namespace boundaries, Bash, child exit status, signals, file permissions and hard links, device nodes, private pseudoterminals, the writable shared memory directory, DNS, APT index updates, and the installed init package.
@@ -39,6 +43,8 @@ Docker 29.10.0 started on a private Unix socket with VFS storage in an isolated 
 On the flashed PID-controller build, `pids` is the only controller exposed on cgroup v2. Android holds the CPU, cpuset, memory, and I/O controllers on v1. The running kernel has `CONFIG_VXLAN` and `CONFIG_CFS_BANDWIDTH` disabled. Creating a VXLAN link in a disposable network namespace returned an unsupported-operation error. K3s startup, node registration, and pod networking were not demonstrated.
 
 ### Native K3s prerequisites on vegas26
+
+Use the [worker validation and boot-service procedure](k3s-worker-plan.md#boot-service-candidate) for the unified Android kernel. The boot service is opt-in and requires a separately configured lab agent.
 
 After flashing the combined PID and VXLAN image, K3s v1.37.2+k3s1 `check-config` detected VXLAN and the mounted cgroup v2 hierarchy. It still rejected the available controller set because CPU, cpuset, and memory were missing from v2. It also flagged bridge netfilter, the iptables `addrtype` match, and legacy device and IPVS options. Validate the device policy through cgroup v2 BPF and choose the kube-proxy backend before treating the legacy device and IPVS flags as requirements.
 

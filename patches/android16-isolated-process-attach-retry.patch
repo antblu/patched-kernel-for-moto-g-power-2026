@@ -1,0 +1,63 @@
+diff --git a/libprocessgroup/processgroup.cpp b/libprocessgroup/processgroup.cpp
+--- a/libprocessgroup/processgroup.cpp
++++ b/libprocessgroup/processgroup.cpp
+@@ -738,6 +738,44 @@
+     return KillProcessGroup(uid, initialPid, signal, true);
+ }
+ 
++static int AttachProcessGroup(pid_t pid, uid_t uid, bool v2_path, const std::string& path) {
++    const uid_t app_id = uid % AID_USER_OFFSET;
++    const bool isolated_launch = v2_path && geteuid() == AID_SYSTEM &&
++            app_id >= AID_ISOLATED_START && app_id <= AID_ISOLATED_END;
++    // Pin the proc directory before the first attempt. If the child exits,
++    // reopening a numeric PID could instead find a different process.
++    android::base::unique_fd child(isolated_launch
++            ? open(StringPrintf("/proc/%d", pid).c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC)
++            : -1);
++    const auto id = std::to_string(pid);
++    const auto deadline = std::chrono::steady_clock::now() + 100ms;
++    for (;;) {
++        if (WriteStringToFile(id, path)) return 0;
++        const int error = errno;
++        if (child.get() < 0 || (error != EACCES && error != EPERM) ||
++            std::chrono::steady_clock::now() >= deadline) {
++            PLOG(ERROR) << "Failed to attach pid " << pid << " to " << path;
++            return -error;
++        }
++
++        // An unprivileged zygote can report the PID before the child has
++        // switched to its isolated app domain. Cpuset checks scheduler
++        // permission when the process changes cgroups on the unified hierarchy.
++        std::this_thread::sleep_for(5ms);
++        struct stat status;
++        if (fstatat(child.get(), "status", &status, 0) < 0) {
++            if (errno == ENOENT || errno == ESRCH) return -ESRCH;
++            PLOG(WARNING) << "Could not check isolated process " << pid << " before retry";
++            return -error;
++        }
++        if (std::chrono::steady_clock::now() >= deadline) {
++            LOG(ERROR) << "Timed out attaching isolated pid " << pid << " to " << path
++                       << " (errno " << error << ")";
++            return -error;
++        }
++    }
++}
++
+ static int createProcessGroupInternal(uid_t uid, pid_t initialPid, std::string cgroup,
+                                       bool activate_controllers) {
+     auto uid_path = ConvertUidToPath(cgroup.c_str(), uid, activate_controllers);
+@@ -774,10 +812,10 @@
+     }
+ 
+     const auto uid_pid_procs_file = uid_pid_path + '/' + PROCESSGROUP_CGROUP_PROCS_FILE;
+-    if (!WriteStringToFile(std::to_string(initialPid), uid_pid_procs_file)) {
+-        const int error = errno;
+-        PLOG(ERROR) << "Failed to write '" << initialPid << "' to " << uid_pid_procs_file;
+-        return -error;
++    if (const int error = AttachProcessGroup(initialPid, uid, activate_controllers,
++                                             uid_pid_procs_file);
++        error != 0) {
++        return error;
+     }
+ 
+     if (activate_controllers) {

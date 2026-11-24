@@ -1,0 +1,61 @@
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -33,6 +33,7 @@
+ #include <linux/ptrace.h>
+ #include <linux/profile.h>
+ #include <linux/mount.h>
++#include <linux/kmsg_dump.h>
+ #include <linux/proc_fs.h>
+ #include <linux/kthread.h>
+ #include <linux/mempolicy.h>
+@@ -777,6 +778,42 @@
+ static inline void check_stack_usage(void) {}
+ #endif
+ 
++static bool vegas26_capture_vendor_init __ro_after_init;
++
++static int __init vegas26_enable_vendor_init_capture(char *arg)
++{
++	vegas26_capture_vendor_init = true;
++	return 1;
++}
++__setup("vegas26_vendor_init_capture", vegas26_enable_vendor_init_capture);
++
++static void vegas26_capture_init_child_exit(struct task_struct *tsk, long code)
++{
++	static atomic_t captured = ATOMIC_INIT(0);
++	static const char args[] = "subcontext\0u:r:vendor_init:s0";
++	char cmdline[160];
++	size_t first;
++	int len;
++
++	if (!vegas26_capture_vendor_init || atomic_read(&captured) ||
++	    !thread_group_leader(tsk) || strcmp(tsk->comm, "init") ||
++	    task_ppid_nr(tsk) != 1)
++		return;
++
++	len = get_cmdline(tsk, cmdline, sizeof(cmdline));
++	if (len <= 0)
++		return;
++	first = strnlen(cmdline, len);
++	if (len - first < 1 + sizeof(args) ||
++	    memcmp(cmdline + first + 1, args, sizeof(args)) ||
++	    atomic_cmpxchg(&captured, 0, 1))
++		return;
++
++	pr_err("vegas26 vendor_init first exit: pid=%d status=%ld signal=%ld raw=%#lx\n",
++	       task_pid_nr(tsk), (code >> 8) & 255, code & 127, code);
++	kmsg_dump(KMSG_DUMP_OOPS);
++}
++
+ void __noreturn do_exit(long code)
+ {
+ 	struct task_struct *tsk = current;
+@@ -862,6 +899,7 @@
+ 	audit_free(tsk);
+ 
+ 	tsk->exit_code = code;
++	vegas26_capture_init_child_exit(tsk, code);
+ 	taskstats_exit(tsk, group_dead);
+ 
+ 	exit_mm();

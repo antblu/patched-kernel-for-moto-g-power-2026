@@ -26,6 +26,9 @@ def main():
         "profile=experimental-namespaces-pids-vxlan",
         "profile=experimental-namespaces-pids-vxlan-bridge",
         "profile=experimental-namespaces-pids-vxlan-cfs",
+        "profile=experimental-namespaces-pids-vxlan-k3s",
+        "profile=experimental-namespaces-pids-vxlan-k3s-unified",
+        "profile=vegas26-vendor-init-diagnostic",
     }
     if (f"{digest}  arch/arm64/boot/Image" not in manifest or
             supported_profiles.isdisjoint(manifest) or image[56:60] != b"ARM\x64"):

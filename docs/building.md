@@ -48,3 +48,26 @@ The combined build passed the audit for all 399 stock vendor modules, preserved 
 `--namespaces-pids-vxlan-cfs` combines PID limits, built-in VXLAN, and CFS bandwidth CPU quotas. It stores CFS bandwidth state outside the vendor-visible scheduler structures, preserving 100% of the 15,422 exported kernel symbol CRCs and passing the vendor module audit for all 399 stock modules. The build was compiled with full production LTO and Clang CFI (`CONFIG_LTO_CLANG_FULL=y`, `CONFIG_CFI_CLANG=y`).
 
 The candidate booted on slot A on the test phone (`W1WEOS36.48-22-3-3-4-2`). SELinux remained enforcing, all 360 vendor modules loaded with zero module loader warnings, and `k3s check-config` verified `CONFIG_CFS_BANDWIDTH: enabled`. Hardware validation via `tests/test-cfs-phone.sh` configured a 10% CPU quota (10,000 us per 100,000 us period) across two busy workers pinned to separate CPU cores via toybox `taskset`. The test recorded 20 out of 20 throttled periods, accumulating 3.69 seconds of enforced throttling time. All 17 Debian regression checks and bidirectional VXLAN packet tests passed on hardware.
+
+
+## K3s candidate
+
+Build the separate v2-only candidate with `JOBS=8 bash scripts/build-stock.sh --k3s-unified`. This profile keeps the pinned GKI command line and adds `cgroup_no_v1=all,named`. Test the resulting Image with `tests/test-vxlan-vm.sh` and `--built-in-unified`, which requires the restriction to come from the kernel and checks that a named v1 mount fails. Deploy this profile with the completed Android policy migration. [Worker plan](k3s-worker-plan.md)
+
+`JOBS=8 bash scripts/build-stock.sh --k3s` combines the PID, VXLAN, CFS, and bridge netfilter profiles and enables the iptables address-type match and IP sets. Audit the combined build independently against both vendor module sets. Run the PID probe and both the CFS and K3s netfilter modes of the VXLAN VM test against the resulting Image.
+
+The first full-LTO candidate passed the import CRC audit for all 399 vendor modules. Relative to the phone's CFS build, it added 26 exports, removed none, and changed nine export CRCs. The audited cgroup, scheduler, and networking structures retained their layout. The bridge extension added a field in existing `skb_ext` padding. QEMU passed PID limits, cgroup v2 CPU throttling, bidirectional VXLAN, bridge filtering, and the iptables address-type match.
+
+The kernel profile alone does not migrate Android's controller ownership. The stock slot A `boot` image has no embedded ramdisk, while `init_boot_a` contains the Magisk ramdisk. The first offline-repacked vendor descriptor overlay was rejected by Fastboot preflash validation. Android subsequently booted and the active `init_boot_a` hash still matched the pre-test backup.
+
+A fresh AVB hash descriptor passed offline verification, but bootloader Fastboot still rejected the `init_boot_a` canary. An authorized write from rooted Android installed the same image. Android booted with SELinux enforcing, and the partition hash matched the canary. The first canary kept the original controller assignments. Magisk removes pre-init overlays when its daemon starts, so a post-boot file comparison alone cannot establish whether Android init saw the overlay. [Magisk 31.1 overlay cleanup](https://github.com/topjohnwu/Magisk/blob/v31.1/native/src/core/daemon.rs#L359-L381)
+
+Fastboot accepted the separate K3s `boot_a` image. Android booted with SELinux enforcing, the flashed kernel payload matched the candidate, and the same 360 vendor modules loaded. Bidirectional VXLAN and all 18 Debian regression checks passed on the phone. Android and Debian both exposed and delegated `pids` with the [PIDs canary](cgroup-v2-migration.md). K3s `check-config` recognized the new networking options and still failed its cgroup v2 check because Android keeps CPU, cpuset, and memory on v1. Node readiness and pod execution remain unverified.
+
+After booting a candidate with cgroup v2 delegation and joining a disposable cluster, run the host-side readiness test:
+
+```sh
+bash tests/test-k3s-agent.sh /path/to/test-kubeconfig test-context phone-node "registry.example/busybox@sha256:YOUR_IMAGE_DIGEST"
+```
+
+This requires the named phone node to be Ready and a digest-pinned ARM64 workload to succeed on that node.

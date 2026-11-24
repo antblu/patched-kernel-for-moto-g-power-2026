@@ -1,0 +1,25 @@
+diff --git a/libprocessgroup/task_profiles.cpp b/libprocessgroup/task_profiles.cpp
+index 89ca7f1..c87f744 100644
+--- a/libprocessgroup/task_profiles.cpp
++++ b/libprocessgroup/task_profiles.cpp
+@@ -175,6 +175,20 @@ bool ProfileAttribute::GetPathForTask(pid_t tid, std::string* path) const {
+         return true;
+     }
+ 
++    // The CPU scheduling subtree is threaded. Memory and I/O attributes
++    // belong to the enclosing process domain even when the caller names a TID.
++    if (controller()->version() == 2 &&
++        (std::string_view(controller()->name()) == "memory" ||
++         std::string_view(controller()->name()) == "io")) {
++        constexpr std::string_view scheduling_group = "/vegas26-sched";
++        const size_t boundary = subgroup.find(scheduling_group);
++        if (boundary != std::string::npos &&
++            (boundary + scheduling_group.size() == subgroup.size() ||
++             subgroup[boundary + scheduling_group.size()] == '/')) {
++            subgroup.resize(boundary);
++        }
++    }
++
+     if (subgroup.empty()) {
+         *path = StringPrintf("%s/%s", controller()->path(), file_name().c_str());
+     } else {

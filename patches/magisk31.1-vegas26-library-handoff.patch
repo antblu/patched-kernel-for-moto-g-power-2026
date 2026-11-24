@@ -1,0 +1,45 @@
+diff --git a/native/src/init/rootdir.rs b/native/src/init/rootdir.rs
+index 75cfab2..e11fbc3 100644
+--- a/native/src/init/rootdir.rs
++++ b/native/src/init/rootdir.rs
+@@ -100,7 +100,39 @@ impl MagiskInit {
+     pub(crate) fn restore_overlay_contexts(&self) {
+         self.overlay_con.iter().for_each(|attr| {
+             let OverlayAttr(path, con) = attr;
+-            path.set_secontext(con).log_ok();
++            if path.as_str() != "/system/lib64/libprocessgroup.so" {
++                path.set_secontext(con).log_ok();
++                return;
++            }
++
++            use base::libc;
++            let relabeled = path.set_secontext(con).is_ok();
++            let mut actual = cstr::buf::default();
++            let context_ok = path.get_secontext(&mut actual).is_ok()
++                && actual.as_str() == con.as_str()
++                && actual.as_str() == "u:object_r:system_lib_file:s0";
++            let mut mount = mem::MaybeUninit::<libc::statfs>::uninit();
++            let flags = unsafe {
++                if libc::statfs(path.as_ptr(), mount.as_mut_ptr()) == 0 {
++                    Some(mount.assume_init().f_flags as libc::c_ulong)
++                } else {
++                    None
++                }
++            };
++            let exec_mount = flags.is_some_and(|flags| flags & libc::ST_NOEXEC == 0);
++            let metadata = std::fs::metadata(path.as_str()).ok();
++            use std::os::unix::fs::MetadataExt;
++            base::info!(
++                "vegas26 libprocessgroup handoff: relabeled={relabeled}, label={}, flags={flags:?}, inode={:?}, owner={:?}, mode={:?}",
++                actual.as_str(),
++                metadata.as_ref().map(|m| m.ino()),
++                metadata.as_ref().map(|m| (m.uid(), m.gid())),
++                metadata.as_ref().map(|m| m.mode()),
++            );
++            if !relabeled || !context_ok || !exec_mount || metadata.is_none() {
++                base::error!("vegas26 libprocessgroup handoff rejected; restoring firmware library");
++                path.unmount().log_ok();
++            }
+         })
+     }
+ }

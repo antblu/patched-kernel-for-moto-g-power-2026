@@ -1,0 +1,160 @@
+diff --git a/native/src/init/lib.rs b/native/src/init/lib.rs
+index 117a532..2981bfb 100644
+--- a/native/src/init/lib.rs
++++ b/native/src/init/lib.rs
+@@ -84,6 +84,7 @@ pub mod ffi {
+     extern "Rust" {
+         type OverlayAttr;
+         fn parse_config_file(self: &mut MagiskInit);
++        fn mount_vegas26_library(self: &mut MagiskInit);
+         fn mount_overlay(self: &mut MagiskInit, dest: Utf8CStrRef);
+         fn handle_sepolicy(self: &mut MagiskInit);
+         fn restore_overlay_contexts(self: &MagiskInit);
+diff --git a/native/src/init/rootdir.cpp b/native/src/init/rootdir.cpp
+index 3110cd7..b791d21 100644
+--- a/native/src/init/rootdir.cpp
++++ b/native/src/init/rootdir.cpp
+@@ -62,12 +62,22 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
+     {
+         owned_fd src_rc = xopenat(src_fd, INIT_RC, O_RDONLY | O_CLOEXEC, 0);
+         if (src_rc < 0) return false;
++        owned_fd policy_rc = -1;
++        if (!writable && string_view(src_path) == NEW_INITRC_DIR) {
++            // patch_ro_root placed this file in our working directory.
++            if (access("vegas26-init.rc.in", F_OK) == 0) {
++                policy_rc = xopen("vegas26-init.rc.in", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
++                if (policy_rc < 0) return false;
++                LOGD("Using vegas26 init policy input\n");
++            }
++        }
+         if (writable) unlinkat(src_fd, INIT_RC, 0);
+         auto dest_rc = xopen_file(
+                 xopenat(dest_fd, INIT_RC, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
+         if (!dest_rc) return false;
+         LOGD("Patching " INIT_RC " in %s\n", src_path);
+-        file_readline(src_rc, [&dest_rc](Utf8CStr line) -> bool {
++        int input = policy_rc >= 0 ? int(policy_rc) : int(src_rc);
++        file_readline(input, [&dest_rc](Utf8CStr line) -> bool {
+             // Do not start vaultkeeper
+             if (line.sv().contains("start vaultkeeper")) {
+                 LOGD("Remove vaultkeeper\n");
+@@ -317,6 +327,7 @@ void MagiskInit::patch_ro_root() noexcept {
+     // Extract overlay archives
+     extract_files(false);
+ 
++    mount_vegas26_library();
+     handle_sepolicy();
+     unlink("init-ld");
+ 
+diff --git a/native/src/init/rootdir.rs b/native/src/init/rootdir.rs
+index 75cfab2..67072f4 100644
+--- a/native/src/init/rootdir.rs
++++ b/native/src/init/rootdir.rs
+@@ -37,7 +37,8 @@ on property:sys.boot_completed=1
+     mem::forget(file)
+ }
+ 
+-pub struct OverlayAttr(Utf8CString, Utf8CString);
++const VEGAS26_LIBRARY: &str = "/system/lib64/libprocessgroup.so";
++pub struct OverlayAttr(Utf8CString, Utf8CString, Option<(u64, u64)>);
+ 
+ impl MagiskInit {
+     pub(crate) fn parse_config_file(&mut self) {
+@@ -53,6 +54,30 @@ impl MagiskInit {
+         }
+     }
+ 
++    pub(crate) fn mount_vegas26_library(&mut self) {
++        self.prepare_vegas26_library().log_ok();
++    }
++
++    fn prepare_vegas26_library(&mut self) -> LoggedResult<()> {
++        use std::os::unix::fs::MetadataExt;
++        let dest = cstr!("/system/lib64/libprocessgroup.so");
++        let src = cstr::buf::dynamic(128)
++            .join_path(cstr!(ROOTOVL))
++            .join_path(VEGAS26_LIBRARY.trim_start_matches('/'));
++        if !src.exists() || !dest.exists() {
++            return Ok(());
++        }
++        let mut context = cstr::buf::default();
++        dest.get_secontext(&mut context)?;
++        clone_attr(dest, &src)?;
++        let metadata = std::fs::metadata(src.as_str()).log()?;
++        let inode = (metadata.dev(), metadata.ino());
++        src.bind_mount_to(dest, false)?;
++        self.overlay_con
++            .push(OverlayAttr(dest.to_owned(), context.to_owned(), Some(inode)));
++        Ok(())
++    }
++
+     fn mount_impl(
+         &mut self,
+         src_dir: &Utf8CStr,
+@@ -68,6 +93,13 @@ impl MagiskInit {
+                     let name = e.name();
+                     let src = cstr::buf::dynamic(256).join_path(src_dir).join_path(name);
+                     let dest = cstr::buf::dynamic(256).join_path(dest_dir).join_path(name);
++                    if dest.as_str() == VEGAS26_LIBRARY {
++                        if self.overlay_con.iter().any(|attr| attr.2.is_some()) {
++                            mount_list.push_str(VEGAS26_LIBRARY);
++                            mount_list.push('\n');
++                        }
++                        continue;
++                    }
+                     if dest.exists() {
+                         if e.is_dir() {
+                             // Recursive
+@@ -78,7 +110,7 @@ impl MagiskInit {
+                             dest.get_secontext(&mut con)?;
+                             src.bind_mount_to(&dest, false)?;
+                             self.overlay_con
+-                                .push(OverlayAttr(dest.to_owned(), con.to_owned()));
++                                .push(OverlayAttr(dest.to_owned(), con.to_owned(), None));
+                             mount_list.push_str(dest.as_str());
+                             mount_list.push('\n');
+                         }
+@@ -99,8 +131,41 @@ impl MagiskInit {
+ 
+     pub(crate) fn restore_overlay_contexts(&self) {
+         self.overlay_con.iter().for_each(|attr| {
+-            let OverlayAttr(path, con) = attr;
+-            path.set_secontext(con).log_ok();
++            let OverlayAttr(path, con, expected_inode) = attr;
++            let Some(expected_inode) = expected_inode else {
++                path.set_secontext(con).log_ok();
++                return;
++            };
++
++            use base::libc;
++            let relabeled = path.set_secontext(con).is_ok();
++            let mut actual = cstr::buf::default();
++            let context_ok = path.get_secontext(&mut actual).is_ok()
++                && actual.as_str() == con.as_str()
++                && actual.as_str() == "u:object_r:system_lib_file:s0";
++            let mut mount = mem::MaybeUninit::<libc::statfs>::uninit();
++            let flags = unsafe {
++                if libc::statfs(path.as_ptr(), mount.as_mut_ptr()) == 0 {
++                    Some(mount.assume_init().f_flags as libc::c_ulong)
++                } else {
++                    None
++                }
++            };
++            let exec_mount = flags.is_some_and(|flags| flags & libc::ST_NOEXEC == 0);
++            let metadata = std::fs::metadata(path.as_str()).ok();
++            use std::os::unix::fs::MetadataExt;
++            base::info!(
++                "vegas26 libprocessgroup handoff: relabeled={relabeled}, label={}, flags={flags:?}, inode={:?}, owner={:?}, mode={:?}",
++                actual.as_str(),
++                metadata.as_ref().map(|m| m.ino()),
++                metadata.as_ref().map(|m| (m.uid(), m.gid())),
++                metadata.as_ref().map(|m| m.mode()),
++            );
++            let inode_ok = metadata.as_ref().is_some_and(|m| (m.dev(), m.ino()) == *expected_inode);
++            if !relabeled || !context_ok || !exec_mount || !inode_ok {
++                base::error!("vegas26 libprocessgroup handoff rejected; restoring firmware library");
++                path.unmount().log_ok();
++            }
+         })
+     }
+ }

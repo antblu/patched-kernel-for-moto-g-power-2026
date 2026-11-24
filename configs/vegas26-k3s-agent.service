@@ -1,0 +1,17 @@
+[Unit]
+Description=K3s agent in the vegas26 Debian container
+ConditionPathExists=/etc/rancher/k3s/vegas26-lab/config.yaml
+
+[Service]
+Type=notify
+ExecStartPre=/usr/bin/mount --make-rshared /
+ExecStart=/usr/local/bin/k3s agent --config /etc/rancher/k3s/vegas26-lab/config.yaml
+Delegate=yes
+OOMScoreAdjust=-1000
+KillMode=process
+Restart=on-failure
+RestartSec=15
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

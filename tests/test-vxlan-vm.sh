@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ $# -lt 3 || $# -gt 4 ]]; then
-    printf 'Usage: bash tests/test-vxlan-vm.sh <ARM64-Image> <Debian-rootfs.tar.gz> <ARM64-deb-directory> [--bridge-netfilter|--cfs]\n' >&2
+    printf 'Usage: bash tests/test-vxlan-vm.sh <ARM64-Image> <Debian-rootfs.tar.gz> <ARM64-deb-directory> [--bridge-netfilter|--cfs|--unified|--built-in-unified|--k3s-netfilter]\n' >&2
     exit 2
 fi
 image=$(realpath -- "$1")
@@ -10,10 +10,19 @@ rootfs=$(realpath -- "$2")
 packages=$(realpath -- "$3")
 tests_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 cpus=1
+boot_args='console=ttyAMA0 quiet rdinit=/init panic=-1'
 case ${4:-} in
     '') extra_test=; extra_marker= ;;
     --bridge-netfilter) extra_test=bridge-netfilter-vm.inc; extra_marker=BRIDGE_NETFILTER_PASS ;;
-    --cfs) extra_test=cfs-vm.inc; extra_marker=CFS_THROTTLE_PASS; cpus=2 ;;
+    --k3s-netfilter) extra_test=bridge-netfilter-vm.inc; extra_marker=K3S_PHYSDEV_PASS ;;
+    --cfs) extra_test=cfs-vm.inc; extra_marker=ANDROID_WEBVIEW_CGROUP_PLACEMENT_PASS; cpus=2 ;;
+    --unified)
+        extra_test=cfs-vm.inc; extra_marker=ANDROID_WEBVIEW_CGROUP_PLACEMENT_PASS; cpus=2
+        boot_args+=' cgroup_no_v1=all'
+        ;;
+    --built-in-unified)
+        extra_test=cfs-vm.inc; extra_marker=ANDROID_WEBVIEW_CGROUP_PLACEMENT_PASS; cpus=2
+        ;;
     *) printf 'Unknown VM test: %s\n' "$4" >&2; exit 2 ;;
 esac
 scratch=$(mktemp -d)
@@ -51,15 +60,87 @@ ping -I vx0 -c 2 -W 3 198.51.100.2
 ip netns exec vxpeer ping -I vx1 -c 2 -W 3 198.51.100.1
 echo VXLAN_TRAFFIC_PASS
 EOF
+if [[ ${4:-} == --built-in-unified ]]; then
+    cp "$tests_dir/../scripts/check-k3s-cgroup-v2.sh" \
+        "$tests_dir/../scripts/run-in-k3s-runtime.sh" \
+        "$tests_dir/../scripts/update-vegas26-top-app-mask.sh" "$scratch/root/"
+    cat >> "$scratch/root/init" <<'EOF'
+grep -Eq '(^| )cgroup_no_v1=all,named( |$)' /proc/cmdline
+grep -Eq '(^| )rdinit=/init( |$)' /proc/cmdline
+mkdir -p /run/legacy-named
+if mount -t cgroup -o none,name=k3s-probe none /run/legacy-named; then
+    echo 'Named legacy hierarchy mounted during unified-mode test' >&2
+    exit 1
+fi
+awk '$0 ~ / - cgroup / { found=1 } END { exit found }' /proc/self/mountinfo
+EOF
+fi
+if [[ ${4:-} == --unified ]]; then
+    cat >> "$scratch/root/init" <<'EOF'
+mkdir -p /run/legacy-named
+mount -t cgroup -o none,name=k3s-probe none /run/legacy-named
+umount /run/legacy-named
+echo LEGACY_NAMED_CONTROL_PASS
+EOF
+fi
 if [[ -n $extra_test ]]; then
     cat "$tests_dir/$extra_test" >> "$scratch/root/init"
+fi
+if [[ ${4:-} == --built-in-unified ]]; then
+    cat >> "$scratch/root/init" <<'EOF'
+/bin/sh /check-k3s-cgroup-v2.sh
+echo K3S_CGROUP_PREFLIGHT_PASS
+mkdir -p /dev/cpuset/top-app
+printf '1\n' > /dev/cpuset/top-app/cpus
+for domain in "$app" "$other"; do
+    leaf=$domain/vegas26-sched/background/top-app
+    mkdir "$leaf"
+    printf 'threaded\n' > "$leaf/cgroup.type"
+done
+/bin/sh /update-vegas26-top-app-mask.sh
+for domain in "$app" "$other"; do
+    test "$(cat "$domain/vegas26-sched/background/top-app/cpuset.cpus.effective")" = 1
+done
+echo VEGAS26_TOP_APP_MASK_PASS
+/bin/sh /run-in-k3s-runtime.sh /bin/sh -ec '
+    grep -Fxq "0::/runtime/agent" /proc/self/cgroup
+    test "$(umask)" = 0022
+    if /bin/sh /run-in-k3s-runtime.sh /bin/true; then
+        echo "Runtime lock admitted a second agent" >&2
+        exit 1
+    fi
+'
+echo K3S_RUNTIME_LAUNCH_PASS
+EOF
+    extra_marker=K3S_RUNTIME_LAUNCH_PASS
+fi
+if [[ ${4:-} == --k3s-netfilter ]]; then
+    cat >> "$scratch/root/init" <<'EOF'
+ip link set lo up
+iptables-legacy -A OUTPUT -p icmp -m addrtype --dst-type LOCAL -j DROP
+if ping -c 1 -W 2 127.0.0.1; then
+    echo 'Address-type filter failed to block local ICMP' >&2
+    exit 1
+fi
+iptables-legacy -D OUTPUT -p icmp -m addrtype --dst-type LOCAL -j DROP
+ping -c 1 -W 2 127.0.0.1
+echo K3S_ADDRTYPE_PASS
+iptables-legacy -A FORWARD -m physdev --physdev-is-bridged -p icmp -j DROP
+if ip netns exec brpeer1 ping -c 1 -W 2 198.51.100.10; then
+    echo 'Physical bridge match failed to block matching packets' >&2
+    exit 1
+fi
+iptables-legacy -D FORWARD -m physdev --physdev-is-bridged -p icmp -j DROP
+ip netns exec brpeer1 ping -c 1 -W 3 198.51.100.10
+echo K3S_PHYSDEV_PASS
+EOF
 fi
 chmod +x "$scratch/root/init"
 (cd "$scratch/root" && find . -print0 | cpio --null --quiet -o -H newc | gzip -n > "$scratch/rootfs.gz")
 timeout 120s qemu-system-aarch64 -machine virt -cpu cortex-a57 -smp "$cpus" -m 768M \
     -nodefaults -nic none -display none -monitor none -serial stdio -no-reboot \
     -kernel "$image" -initrd "$scratch/rootfs.gz" \
-    -append 'console=ttyAMA0 quiet rdinit=/init panic=-1' | tee "$scratch/console.log"
+    -append "$boot_args" | tee "$scratch/console.log"
 grep -q '^VXLAN_TRAFFIC_PASS' "$scratch/console.log"
 if [[ -n $extra_marker ]]; then
     grep -q "^$extra_marker" "$scratch/console.log"

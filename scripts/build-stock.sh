@@ -8,7 +8,7 @@ source_dir="$cache/ack-$ack"
 toolchain="$cache/clang-$clang/bin"
 profile=experimental-gki
 if (( $# > 1 )); then
-    printf 'Usage: bash scripts/build-stock.sh [--namespaces|--namespaces-vxlan|--namespaces-pids|--namespaces-pids-vxlan|--namespaces-pids-vxlan-bridge|--namespaces-pids-vxlan-cfs]\n' >&2
+    printf 'Usage: bash scripts/build-stock.sh [--namespaces|--namespaces-vxlan|--namespaces-pids|--namespaces-pids-vxlan|--namespaces-pids-vxlan-bridge|--namespaces-pids-vxlan-cfs|--k3s|--k3s-unified]\n' >&2
     exit 2
 fi
 fragments=()
@@ -24,6 +24,15 @@ case ${1:-} in
     --namespaces-pids-vxlan-cfs)
         profile=experimental-namespaces-pids-vxlan-cfs
         fragments=(namespaces.config pids.config vxlan.config cfs-bandwidth.config)
+        ;;
+    --k3s|--k3s-unified)
+        profile=experimental-namespaces-pids-vxlan-k3s
+        fragments=(namespaces.config pids.config vxlan.config cfs-bandwidth.config
+                   bridge-netfilter.config k3s-netfilter.config)
+        if [[ $1 == --k3s-unified ]]; then
+            profile+=-unified
+            fragments+=(cgroup-v2-only.config)
+        fi
         ;;
     --namespaces-vxlan) profile=experimental-namespaces-vxlan; fragments=(namespaces.config vxlan.config) ;;
     *) printf 'Unknown build profile: %s\n' "$1" >&2; exit 2 ;;
@@ -66,11 +75,11 @@ if [[ $profile == experimental-namespaces-pids* ]]; then
     command -v patch >/dev/null || { printf 'Missing build tool: patch\n' >&2; exit 1; }
     patches=("$project/patches/pids-legacy-slot.patch")
     kcflags+=' -DMOTO_PIDS_LEGACY_SLOT'
-    if [[ $profile == experimental-namespaces-pids-vxlan-bridge ]]; then
+    if [[ $profile == experimental-namespaces-pids-vxlan-bridge || $profile == *-k3s* ]]; then
         patches+=("$project/patches/bridge-legacy-skb-ext.patch")
         kcflags+=' -DMOTO_BRIDGE_LEGACY_SKB_EXT'
     fi
-    if [[ $profile == experimental-namespaces-pids-vxlan-cfs ]]; then
+    if [[ $profile == experimental-namespaces-pids-vxlan-cfs || $profile == *-k3s* ]]; then
         patches+=("$project/patches/cfs-separate-state.patch")
     fi
     patch_hash=$(cat -- "${patches[@]}" | sha256sum)
@@ -102,7 +111,8 @@ configure() {
         "${build[@]}" olddefconfig || return
         for fragment in "${paths[@]}"; do
             while IFS= read -r setting; do
-                [[ $setting == CONFIG_*=y || $setting == '# CONFIG_'*' is not set' ]] || continue
+                [[ $setting == CONFIG_*=y || $setting == CONFIG_CMDLINE=* ||
+                    $setting == '# CONFIG_'*' is not set' ]] || continue
                 if ! grep -Fxq -- "$setting" "$output/.config"; then
                     printf 'Kconfig did not resolve %s\n' "$setting" >&2
                     return 1
