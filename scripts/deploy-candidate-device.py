@@ -22,15 +22,15 @@ fastboot = [str(fastboot_exe), "-s", serial]
 
 repo_root = Path(r"C:\Users\antbl\Documents\custom-kernel-for-moto-g-power-2026")
 kernel = repo_root / ".cache/k3s-active-baseline/boot-unified-physdev-v4.img"
-ramdisk = repo_root / ".cache/webview-cgroup-canary/init_boot-retry.img"
+ramdisk = repo_root / ".cache/webview-cgroup-canary/init_boot-zero-err.img"
 stock = Path(r"C:\Users\antbl\MotoRoot\private-backups\boot_a.img")
 stock_magisk = Path(r"C:\Users\antbl\MotoRoot\magisk-patched-init_boot.img")
 
 kernel_hash = "4a6ad4606f2c88a783aa808d852cf79b1925a74ac76bd681dec7a470f4de5439"
-ramdisk_hash = "acce2218d5a138b65a710288a3554fc24a7b8bb9938e2e931e81692da608390b"
+ramdisk_hash = "5d0c140c61ec4f15f3e4e34a9a616b0030128e617df8e00adc5bf97abb4d3da9"
 stock_hash = "32a0ba7c3028d0323726f119133ad63a0fc0bd9d4005ba03459b7e1258250e8f"
 magisk_hash = "fbac252d15501e8350b65ae93a92962f93d2907144286c04abf2eeda26c246d0"
-library_hash = "9b83d95d2f23d670c0d26aabeda8ba2f318bd49890ca46839d0e35598dee934d"
+library_hash = "774186e3adf5edaf69d1e214198743f9a2d156fd94a813496287e9e21b5b57aa"
 
 
 def run(tool, *args, timeout=15, check=True):
